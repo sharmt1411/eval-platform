@@ -34,6 +34,33 @@ from backend.app.adapters.base import BaseModelAdapter
 router = APIRouter(prefix="/benchmarks", tags=["常规评测"])
 
 
+def _mask_api_key(api_key: Optional[str]) -> Optional[str]:
+    """对非空真实 API Key 执行脱敏掩码，防止密钥随任务记录明文泄漏。"""
+    if api_key is None:
+        return None
+    raw = str(api_key).strip()
+    if not raw or raw.upper() == "EMPTY" or "***" in raw:
+        return api_key
+    if len(raw) <= 8:
+        return "***"
+    return f"{raw[:3]}***{raw[-4:]}"
+
+
+def _sanitize_model_configs(model_configs: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    if not isinstance(model_configs, list):
+        return model_configs
+    sanitized: List[Dict[str, Any]] = []
+    for item in model_configs:
+        if isinstance(item, dict):
+            copied = dict(item)
+            if "api_key" in copied:
+                copied["api_key"] = _mask_api_key(copied.get("api_key"))
+            sanitized.append(copied)
+        else:
+            sanitized.append(item)
+    return sanitized
+
+
 def _execute_benchmark_task(task_id: str, payload: BenchmarkRunRequest):
     from backend.app.models import SessionLocal
 
@@ -90,7 +117,7 @@ def _execute_benchmark_task(task_id: str, payload: BenchmarkRunRequest):
                         m_cfg.display_name = m_db.name or m_db.id
                     if not m_cfg.api_url:
                         m_cfg.api_url = m_db.api_url
-                    if not m_cfg.api_key:
+                    if not m_cfg.api_key or "***" in str(m_cfg.api_key):
                         m_cfg.api_key = m_db.api_key
                     if not m_cfg.model_name:
                         m_cfg.model_name = m_db.model_name or m_db.id
@@ -199,7 +226,9 @@ def _execute_benchmark_task(task_id: str, payload: BenchmarkRunRequest):
                     cur_res["result_file"] = res_file
                     cur_res["max_tokens"] = payload.max_tokens
                     cur_res["ignore_sample_max_tokens"] = payload.ignore_sample_max_tokens
-                    cur_res["model_configs"] = [m.model_dump() for m in model_configs]
+                    cur_res["model_configs"] = _sanitize_model_configs(
+                        [m.model_dump() for m in model_configs]
+                    )
                     cur_res["dataset_total_samples"] = total_dataset_samples
                     cur_res["sampled_samples"] = len(samples_to_run)
                     cur_res["skipped_mastered_samples"] = len(skipped_samples)
@@ -257,7 +286,7 @@ def _execute_benchmark_task(task_id: str, payload: BenchmarkRunRequest):
             "max_tokens": payload.max_tokens,
             "ignore_sample_max_tokens": payload.ignore_sample_max_tokens,
             "dataset_path": payload.dataset_path,
-            "model_configs": [m.model_dump() for m in model_configs],
+            "model_configs": _sanitize_model_configs([m.model_dump() for m in model_configs]),
             "dataset_total_samples": total_dataset_samples,
             "sampled_samples": len(samples_to_run),
             "skipped_mastered_samples": len(skipped_samples),
@@ -341,7 +370,7 @@ def list_benchmark_tasks(
             "ignore_sample_max_tokens": parsed_res.get("ignore_sample_max_tokens", False),
             "progress_detail": parsed_res.get("progress_detail"),
             "summaries": parsed_res.get("summaries", {}),
-            "model_configs": parsed_res.get("model_configs"),
+            "model_configs": _sanitize_model_configs(parsed_res.get("model_configs")),
             "sampling_config": parsed_res.get("sampling_config"),
             "dataset_total_samples": parsed_res.get("dataset_total_samples"),
             "sampled_samples": parsed_res.get("sampled_samples"),
@@ -400,7 +429,7 @@ def trigger_benchmark(
         progress=0.0,
         result_json=json.dumps({
             "dataset_path": payload.dataset_path,
-            "model_configs": initial_model_configs,
+            "model_configs": _sanitize_model_configs(initial_model_configs),
             "model_ids": payload.model_ids or [],
             "judge_model_id": payload.judge_model_id,
             "workers": payload.workers,
@@ -424,6 +453,9 @@ def get_benchmark_task_status(task_id: str, db: Session = Depends(get_db)):
     if not task:
         raise HTTPException(status_code=404, detail="未找到该任务")
 
+    parsed_res = json.loads(task.result_json or "{}")
+    if isinstance(parsed_res, dict) and "model_configs" in parsed_res:
+        parsed_res["model_configs"] = _sanitize_model_configs(parsed_res.get("model_configs"))
     res = {
         "id": task.id,
         "task_type": task.task_type,
@@ -432,7 +464,7 @@ def get_benchmark_task_status(task_id: str, db: Session = Depends(get_db)):
         "error_message": task.error_message,
         "created_at": task.created_at,
         "finished_at": task.finished_at,
-        "result": json.loads(task.result_json or "{}"),
+        "result": parsed_res,
     }
     return res
 

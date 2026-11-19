@@ -218,16 +218,36 @@ def stream_sim_cmd(
     emit_output(ctx, out)
 
 
+def _brief_recent_battle(item: Dict[str, Any]) -> Dict[str, Any]:
+    init_eval = item.get("initial_eval") or {}
+    ver_eval = item.get("verified_eval") or {}
+    return {
+        "sample_id": item.get("sample_id"),
+        "task_id": item.get("task_id"),
+        "rule_id": item.get("rule_id"),
+        "scenario_id": item.get("scenario_id"),
+        "status": item.get("status"),
+        "score": item.get("score"),
+        "total_turns": item.get("total_turns"),
+        "initial_verdict": init_eval.get("verdict") if isinstance(init_eval, dict) else None,
+        "verified_verdict": ver_eval.get("verdict") if isinstance(ver_eval, dict) else None,
+        "has_remediated": bool(item.get("remediated")),
+        "updated_at": item.get("updated_at"),
+    }
+
+
 @click.command("recent")
 @click.option("--rule-id", default=None, help="按规则 ID 过滤")
 @click.option("--status", default=None, help="按样本状态过滤")
 @click.option("--limit", type=int, default=50, show_default=True, help="返回最大条数")
+@click.option("--brief", is_flag=True, help="返回紧凑会话摘要，省略大体积对话正文与质检明细")
 @click.pass_context
 def recent_sim_cmd(
     ctx: click.Context,
     rule_id: Optional[str],
     status: Optional[str],
     limit: int,
+    brief: bool,
 ) -> None:
     """查询最近模拟对弈历史会话"""
     check_command_allowed(ctx, "simulation.recent")
@@ -237,6 +257,8 @@ def recent_sim_cmd(
         "/api/v1/simulation/battles/recent",
         params={"rule_id": rule_id, "status": status, "limit": limit},
     )
+    if brief and isinstance(data, list):
+        data = [_brief_recent_battle(item) for item in data if isinstance(item, dict)]
     emit_output(ctx, data)
 
 

@@ -19,7 +19,6 @@ from backend.app.schemas import (
 from backend.app.schemas.flywheel import InspectionReport, FlywheelRecord
 from backend.app.api.deps import (
     get_adapter_and_config_by_model_id,
-    get_adapter_by_model_id,
     load_rule_schema,
 )
 from backend.app.services.simulation_service import SimulationService
@@ -125,7 +124,7 @@ def run_simulation_battle(
     rule = load_rule_schema(db, payload.rule_id)
 
     target_adapter, target_config = get_adapter_and_config_by_model_id(db, payload.target_model_id)
-    client_adapter = get_adapter_by_model_id(db, payload.client_model_id)
+    client_adapter, client_config = get_adapter_and_config_by_model_id(db, payload.client_model_id)
     judge_adapter, judge_config = get_adapter_and_config_by_model_id(db, payload.judge_model_id)
     remediate_adapter, remediate_config = (
         get_adapter_and_config_by_model_id(db, payload.remediate_model_id)
@@ -134,7 +133,11 @@ def run_simulation_battle(
     )
 
     sim_service = SimulationService(
-        target_adapter, client_adapter, judge_adapter, judge_config=judge_config
+        target_adapter,
+        client_adapter,
+        judge_adapter,
+        judge_config=judge_config,
+        client_config=client_config,
     )
     pipeline = FlywheelPipelineService(
         judge_adapter=judge_adapter,
@@ -205,7 +208,9 @@ def run_simulation_battle_stream(
             target_adapter, target_config = get_adapter_and_config_by_model_id(
                 bg_db, payload.target_model_id
             )
-            client_adapter = get_adapter_by_model_id(bg_db, payload.client_model_id)
+            client_adapter, client_config = get_adapter_and_config_by_model_id(
+                bg_db, payload.client_model_id
+            )
             judge_adapter, judge_config = get_adapter_and_config_by_model_id(
                 bg_db, payload.judge_model_id
             )
@@ -216,7 +221,11 @@ def run_simulation_battle_stream(
             )
 
             sim_service = SimulationService(
-                target_adapter, client_adapter, judge_adapter, judge_config=judge_config
+                target_adapter,
+                client_adapter,
+                judge_adapter,
+                judge_config=judge_config,
+                client_config=client_config,
             )
             pipeline = FlywheelPipelineService(
                 judge_adapter=judge_adapter,

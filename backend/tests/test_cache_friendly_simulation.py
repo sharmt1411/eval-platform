@@ -8,9 +8,10 @@ Prompt Cache 友好型模拟器与两极化人设矩阵专项测试
 """
 import json
 import pytest
-from backend.app.schemas.chat import ChatMessage, UnifiedChatRequest, UnifiedChatResponse
+from backend.app.schemas.chat import ChatMessage, ModelConfig, UnifiedChatRequest, UnifiedChatResponse
 from backend.app.schemas.rule import UniversalRuleSchema, PersonaDefinition
 from backend.app.engine.simulator import UniversalSimulator
+from backend.app.services.simulation_service import SimulationService
 from backend.app.adapters.mock_adapter import MockAdapter
 
 
@@ -131,3 +132,54 @@ def test_polarized_scenarios_matrix_loading():
     case3 = next(s for s in rule.scenarios if s.id == "case_03_minimalist_cold_evader")
     assert case3.persona.get("posture") == "敷衍回避太极"
     assert case3.persona.get("style") == "极简冷漠单字"
+
+
+def test_simulator_respects_client_config_and_safe_max_tokens_default():
+    """验证模拟客户默认 max_tokens 放宽至 2048 且完整透传 client_config（不再写死 256）"""
+    scenario = PersonaDefinition(
+        id="case_cfg_01",
+        name="配置透传测试",
+        persona={"posture": "配合"},
+        instruction="正常沟通。",
+    )
+
+    mock_adapter = MockAdapter("client-mock")
+    captured_reqs = []
+
+    def fake_chat(req: UnifiedChatRequest) -> UnifiedChatResponse:
+        captured_reqs.append(req)
+        return UnifiedChatResponse(content="好的，明白。", model_name="client-mock", status="SUCCESS")
+
+    mock_adapter.chat = fake_chat
+
+    # 1. 未传 client_config 时默认 max_tokens=2048 且关闭思考
+    sim_default = UniversalSimulator(mock_adapter)
+    sim_default.generate_reply(scenario, [])
+    assert captured_reqs[-1].config.max_tokens == 2048
+    assert captured_reqs[-1].config.thinking_enabled is False
+
+    # 2. 透传自定义 client_config 时应原样继承 max_tokens 与 temperature
+    custom_cfg = ModelConfig(
+        temperature=0.65,
+        top_p=0.85,
+        max_tokens=3072,
+        thinking_enabled=False,
+        thinking_level="NONE",
+    )
+    sim_custom = UniversalSimulator(mock_adapter, default_config=custom_cfg)
+    sim_custom.generate_reply(scenario, [])
+    assert captured_reqs[-1].config.max_tokens == 3072
+    assert captured_reqs[-1].config.temperature == 0.65
+    assert captured_reqs[-1].config.top_p == 0.85
+
+    # 3. 通过 SimulationService 透传 client_config 到 client_simulator
+    target_mock = MockAdapter("target-mock")
+    judge_mock = MockAdapter("judge-mock")
+    sim_svc = SimulationService(
+        target_mock,
+        mock_adapter,
+        judge_mock,
+        client_config=ModelConfig(temperature=0.55, max_tokens=2560, thinking_enabled=False),
+    )
+    assert sim_svc.client_simulator.default_config is not None
+    assert sim_svc.client_simulator.default_config.max_tokens == 2560

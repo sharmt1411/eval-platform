@@ -406,7 +406,7 @@ export const BenchmarkList: React.FC = () => {
     if (task.model_configs && task.model_configs.length > 0) {
       task.model_configs.forEach((mc) => {
         midSet.push(mc.model_id);
-        overrides[mc.model_id] = mc;
+        overrides[mc.model_id] = { ...mc, api_key: undefined };
       });
     } else if (task.summaries) {
       Object.keys(task.summaries).forEach((k) => {

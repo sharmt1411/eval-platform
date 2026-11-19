@@ -26,9 +26,10 @@ class SimulationService:
         client_adapter: BaseModelAdapter,
         judge_adapter: BaseModelAdapter,
         judge_config: Optional[ModelConfig] = None,
+        client_config: Optional[ModelConfig] = None,
     ):
         self.target_adapter = target_adapter
-        self.client_simulator = UniversalSimulator(client_adapter)
+        self.client_simulator = UniversalSimulator(client_adapter, default_config=client_config)
         self.judge_engine = UniversalJudgeEngine(judge_adapter, default_config=judge_config)
 
     def run_battle_iter(
@@ -49,7 +50,7 @@ class SimulationService:
         max_turns = max_turns or rule.bot_config.max_turns
         closing_keywords = rule.bot_config.closing_keywords or []
         dialogue_history: List[ChatMessage] = []
-        bot_cfg = target_config or ModelConfig(temperature=0.3, max_tokens=256)
+        bot_cfg = target_config or ModelConfig(temperature=0.3, max_tokens=2048)
 
         system_msg = ChatMessage(role="system", content=rule.bot_config.system_prompt)
 

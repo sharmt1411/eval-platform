@@ -515,6 +515,8 @@ def test_cli_end_to_end_all_groups(
                 mname,
                 "--provider-type",
                 "mock",
+                "--api-key",
+                "sk-secret1234567890abcd" if mid == "cli-mock-target" else "",
                 "--config-json",
                 '{"temperature":0.2,"max_tokens":128,"thinking_enabled":false}',
             ],
@@ -817,9 +819,20 @@ def test_cli_end_to_end_all_groups(
 
     rc, tasks, _ = _run_main(["--in-process", "benchmark", "tasks", "--limit", "10"], capsys)
     assert rc == 0 and any(t["id"] == task_id for t in tasks)
+    target_task = next(t for t in tasks if t["id"] == task_id)
+    assert "sk-secret1234567890abcd" not in json.dumps(target_task, ensure_ascii=False)
+    assert target_task["model_configs"][0]["api_key"] == "sk-***abcd"
+
+    rc, tasks_brief, _ = _run_main(["--in-process", "benchmark", "tasks", "--limit", "10", "--brief"], capsys)
+    assert rc == 0
+    brief_item = next(t for t in tasks_brief if t["id"] == task_id)
+    assert "model_configs" not in brief_item and "sampling_config" not in brief_item
+    assert "models" in brief_item and "CLI被测Mock-V2" in brief_item["models"]
 
     rc, st, _ = _run_main(["--in-process", "benchmark", "status", task_id], capsys)
     assert rc == 0 and st["id"] == task_id
+    assert "sk-secret1234567890abcd" not in json.dumps(st, ensure_ascii=False)
+    assert st["result"]["model_configs"][0]["api_key"] == "sk-***abcd"
 
     # cli_q1 含 "Mock回复" 通过，cli_q2 含 "无法篡改激活记录" 失败
     rc, sbs_fail, _ = _run_main(
@@ -1003,6 +1016,15 @@ def test_cli_end_to_end_all_groups(
         capsys,
     )
     assert rc == 0 and any(it["sample_id"] == sim_sample_id for it in recent_res)
+
+    rc, recent_brief, _ = _run_main(
+        ["--in-process", "simulation", "recent", "--rule-id", "cli_smoke_rule", "--limit", "10", "--brief"],
+        capsys,
+    )
+    assert rc == 0
+    rb_item = next(it for it in recent_brief if it["sample_id"] == sim_sample_id)
+    assert "dialogue" not in rb_item and "remediated" not in rb_item and "initial_eval" not in rb_item
+    assert "total_turns" in rb_item and "initial_verdict" in rb_item
 
     dlg_file = tmp_path / "manual_dialogue.json"
     dlg_file.write_text(

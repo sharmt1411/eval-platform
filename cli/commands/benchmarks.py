@@ -87,14 +87,81 @@ def run_benchmark_cmd(
     emit_output(ctx, status_data)
 
 
+def _mask_api_key_value(api_key: Any) -> Any:
+    if api_key is None:
+        return None
+    raw = str(api_key).strip()
+    if not raw or raw.upper() == "EMPTY" or "***" in raw:
+        return api_key
+    if len(raw) <= 8:
+        return "***"
+    return f"{raw[:3]}***{raw[-4:]}"
+
+
+def _sanitize_task_payload(task: Dict[str, Any]) -> Dict[str, Any]:
+    copied = dict(task)
+    mcs = copied.get("model_configs")
+    if isinstance(mcs, list):
+        sanitized_mcs = []
+        for mc in mcs:
+            if isinstance(mc, dict) and "api_key" in mc:
+                mc_copy = dict(mc)
+                mc_copy["api_key"] = _mask_api_key_value(mc_copy.get("api_key"))
+                sanitized_mcs.append(mc_copy)
+            else:
+                sanitized_mcs.append(mc)
+        copied["model_configs"] = sanitized_mcs
+    res = copied.get("result")
+    if isinstance(res, dict) and isinstance(res.get("model_configs"), list):
+        res_copy = dict(res)
+        res_copy["model_configs"] = [
+            ({**mc, "api_key": _mask_api_key_value(mc.get("api_key"))} if isinstance(mc, dict) and "api_key" in mc else mc)
+            for mc in res["model_configs"]
+        ]
+        copied["result"] = res_copy
+    return copied
+
+
+def _brief_benchmark_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    summaries = task.get("summaries") or {}
+    models_brief: Dict[str, Any] = {}
+    if isinstance(summaries, dict):
+        for mk, mv in summaries.items():
+            if isinstance(mv, dict):
+                models_brief[mk] = {
+                    "pass_rate": mv.get("pass_rate"),
+                    "passed_samples": mv.get("passed_samples"),
+                    "total_samples": mv.get("total_samples"),
+                    "api_error_samples": mv.get("api_error_samples"),
+                }
+    brief = {
+        "id": task.get("id"),
+        "status": task.get("status"),
+        "progress": task.get("progress"),
+        "dataset_path": task.get("dataset_path"),
+        "created_at": task.get("created_at"),
+        "finished_at": task.get("finished_at"),
+        "models": models_brief,
+    }
+    if task.get("error_message"):
+        brief["error_message"] = task.get("error_message")
+    return brief
+
+
 @click.command("tasks")
 @click.option("--limit", type=int, default=50, show_default=True, help="最多返回任务数")
+@click.option("--brief", is_flag=True, help="返回紧凑任务摘要，省略冗长模型配置、API凭据与分类明细")
 @click.pass_context
-def list_tasks_cmd(ctx: click.Context, limit: int) -> None:
+def list_tasks_cmd(ctx: click.Context, limit: int, brief: bool) -> None:
     """列出历史评测任务"""
     check_command_allowed(ctx, "benchmark.tasks")
     client = ensure_client(ctx)
     data = client.request_json("GET", "/api/v1/benchmarks/tasks", params={"limit": limit})
+    if isinstance(data, list):
+        if brief:
+            data = [_brief_benchmark_task(t) for t in data if isinstance(t, dict)]
+        else:
+            data = [_sanitize_task_payload(t) if isinstance(t, dict) else t for t in data]
     emit_output(ctx, data)
 
 
@@ -106,6 +173,8 @@ def task_status_cmd(ctx: click.Context, task_id: str) -> None:
     check_command_allowed(ctx, "benchmark.status")
     client = ensure_client(ctx)
     data = client.request_json("GET", f"/api/v1/benchmarks/tasks/{quote_path_segment(task_id)}")
+    if isinstance(data, dict):
+        data = _sanitize_task_payload(data)
     emit_output(ctx, data)
 
 

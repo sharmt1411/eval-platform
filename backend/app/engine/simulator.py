@@ -28,15 +28,21 @@ from backend.app.engine.prompt_registry import get_active_prompt_template, rende
 class UniversalSimulator:
     """通用客户模拟器 Agent"""
 
-    def __init__(self, adapter: BaseModelAdapter):
+    def __init__(
+        self,
+        adapter: BaseModelAdapter,
+        default_config: Optional[ModelConfig] = None,
+    ):
         self.adapter = adapter
+        self.default_config = default_config
 
     def generate_reply(
         self,
         scenario: PersonaDefinition,
         dialogue_history: List[ChatMessage],
-        temperature: float = 0.4,
+        temperature: Optional[float] = None,
         dynamic_context_note: Optional[str] = None,
+        client_config: Optional[ModelConfig] = None,
     ) -> str:
         """
         根据当前场景设定与历史对话，生成模拟客户的下一句真实口语化发言。
@@ -92,15 +98,25 @@ class UniversalSimulator:
 
         client_messages.extend(inverted_history)
 
+        base_cfg = client_config or self.default_config
+        if base_cfg is not None:
+            req_cfg = base_cfg.model_copy(deep=True)
+            if temperature is not None:
+                req_cfg.temperature = temperature
+            if not req_cfg.max_tokens or req_cfg.max_tokens <= 0:
+                req_cfg.max_tokens = 2048
+        else:
+            req_cfg = ModelConfig(
+                temperature=temperature if temperature is not None else 0.4,
+                max_tokens=2048,
+                thinking_enabled=False,
+                thinking_level="NONE",
+            )
+
         req = UnifiedChatRequest(
             model_id=self.adapter.model_name,
             messages=client_messages,
-            config=ModelConfig(
-                temperature=temperature,
-                max_tokens=256,
-                thinking_enabled=False,
-                thinking_level="NONE",
-            ),
+            config=req_cfg,
         )
 
         try:

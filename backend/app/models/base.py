@@ -166,10 +166,10 @@ def init_db():
                 "config": {
                     "temperature": 0.6,
                     "top_p": 0.9,
-                    "max_tokens": 512,
+                    "max_tokens": 2048,
                     "repetition_penalty": 1.0,
-                    "thinking_enabled": True,
-                    "thinking_level": "LOW",
+                    "thinking_enabled": False,
+                    "thinking_level": "NONE",
                     "vertex_thinking_mode": "gemini_native",
                 },
             },
