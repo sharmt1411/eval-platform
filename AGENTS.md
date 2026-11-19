@@ -63,6 +63,7 @@ eval-platform/
 │   ├── FLYWHEEL_FAQ_EVAL_LOOP_DESIGN.md           # [演进方案] 双轨并行质检(Mermaid∥FAQ)、累积上文切题与复测动态免训闭环设计方案
 │   ├── FLYWHEEL_BENCHMARK_GENERATION_DESIGN.md    # [专项方案] 模拟对练质检/修复生成评测集与数据中心分类管理设计方案说明书
 │   ├── BENCHMARK_SAMPLING_FILTER_DESIGN.md        # [专项方案] 常规评测集动态阶梯降频抽取与复测战绩治理设计方案说明书
+│   ├── images/                                    # [README 展示截图] 脱敏打码后的核心工作台界面截图 (*.png)
 │   └── map/                                       # [系统地图] 分层结构、时序、代码事实与变更图
 │       ├── L1-overview.mmd                        # 系统架构全景图 (L1)
 │       ├── L2-adapters.mmd                        # 统一模型接入底座内部图 (L2)
