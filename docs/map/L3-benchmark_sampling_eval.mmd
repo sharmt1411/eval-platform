@@ -1,0 +1,30 @@
+%% title: 常规评测动态降频抽样与矩阵执行时序图 (L3)
+sequenceDiagram
+  participant benchmark as "常规评测<br/>frontend/src/pages/BenchmarkList.tsx"
+  participant benchmark_report as "评测对比报告<br/>frontend/src/pages/BenchmarkReport.tsx"
+  participant api_benchmarks as "评测路由<br/>backend/app/api/benchmarks.py"
+  participant benchmark_sampler as "抽样与账本引擎<br/>backend/app/engine/benchmark_sampler.py:BenchmarkSamplingEngine"
+  participant benchmark_runner as "评测矩阵执行器<br/>backend/app/engine/benchmark_runner.py:BenchmarkRunner"
+  participant judge_engine as "质检裁判引擎<br/>backend/app/engine/judge.py:UniversalJudgeEngine"
+  participant adapters as "统一模型接入底座<br/>backend/app/adapters"
+  participant sqlite_db as "SQLite 元数据库<br/>data/eval_platform.db"
+
+  benchmark->>api_benchmarks: POST /benchmarks/preview-sampling
+  api_benchmarks->>benchmark_sampler: partition_samples(按账本三池分流)
+  benchmark_sampler->>sqlite_db: 回放 BenchmarkRunLedger 战绩
+  benchmark_sampler-->>benchmark: 返回待测/跳过与预计抽样量
+  benchmark->>api_benchmarks: POST /benchmarks/run
+  api_benchmarks->>sqlite_db: 写入 TaskRecord(PENDING) 并启动后台任务
+  api_benchmarks->>benchmark_sampler: partition_samples(锁定本轮抽样集)
+  api_benchmarks->>benchmark_runner: run_multi_model_matrix(并发矩阵)
+  loop 每个待测模型 x 样本
+    benchmark_runner->>adapters: 推理调用(5次重试+思考剥离)
+    adapters-->>benchmark_runner: UnifiedChatResponse
+    benchmark_runner->>judge_engine: evaluate_benchmark_response(客观通过后Rubric打分)
+    judge_engine-->>benchmark_runner: score / verdict
+    benchmark_runner-->>api_benchmarks: on_sample_done & on_matrix_step 步进落盘
+  end
+  api_benchmarks->>benchmark_sampler: record_run_ledger(按基准模型入账)
+  benchmark_sampler->>sqlite_db: 写入单调递增 BenchmarkRunLedger
+  benchmark_report->>api_benchmarks: 轮询 GET /tasks/{id} & side_by_side
+  api_benchmarks-->>benchmark_report: 返回双口径通过率与对比明细

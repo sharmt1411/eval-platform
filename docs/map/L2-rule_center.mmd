@@ -1,0 +1,31 @@
+%% title: 规则中心纵向切片 (L2)
+%% link: adapters -> L2-adapters.mmd
+%% link: judge_engine -> L2-judge_engine.mmd
+flowchart TB
+  rule_center["规则中心\nfrontend/src/pages/RuleCenter.tsx\n含MermaidViewer与导出工具"]
+  api_rules["规则中心路由\nbackend/app/api/rules.py\n7类规则/对弈Prompt调试"]
+  judge_engine["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine"]
+  faq_retriever["FAQ检索引擎\nbackend/app/engine/faq_retriever.py:UniversalFAQRetriever"]
+  topology_validator["拓扑校验器\nbackend/app/engine/topology.py:UniversalTopologyValidator"]
+  subgraph sg_rule_exec["修复与模拟装配引擎"]
+    remediator["数据修复引擎\nbackend/app/engine/remediator.py:UniversalDataRemediator"]
+    simulator["客户模拟引擎\nbackend/app/engine/simulator.py:UniversalSimulator"]
+  end
+  prompt_registry["提示词注册底座\nbackend/app/engine/prompt_registry.py"]
+  adapters["统一模型接入底座\nbackend/app/adapters"]
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\nPromptTemplateRecord/RuleConfigRecord/RegisteredModel")]
+  rules_dir[("场景规则目录\ndata/rules")]
+  ext_embed(["外部 Embedding 服务"])
+
+  rule_center -->|"配置保存/7类Prompt调试"| api_rules
+  api_rules -->|"组装质检/轨迹/FAQ"| judge_engine
+  api_rules -->|"调试召回规则FAQ"| faq_retriever
+  api_rules -->|"推导示范轨迹"| topology_validator
+  api_rules -->|"组装修复与模拟人设"| sg_rule_exec
+  api_rules -->|"读取默认配置/试跑模型"| adapters
+  api_rules -->|"读写Rule与Model表"| sqlite_db
+  api_rules -->|"同步规则JSON模板"| rules_dir
+  sg_rule_exec -->|"读取激活模板"| prompt_registry
+  api_rules -->|"查询推荐参数"| prompt_registry
+  prompt_registry -->|"读取PromptTemplateRecord"| sqlite_db
+  faq_retriever -.->|"⚠️requests.post直连"| ext_embed

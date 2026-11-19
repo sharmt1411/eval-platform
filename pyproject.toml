@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eval-platform"
+version = "1.0.0"
+description = "通用大模型测试管理与数据飞轮平台 CLI 与后端服务"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1.0",
+    "httpx>=0.27.0",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+evalctl = "cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["cli*", "backend*"]
+
+[tool.setuptools.package-data]
+cli = ["policy.default.yaml", "SKILL.md"]

@@ -1,0 +1,22 @@
+%% title: 本机 Coding Agent CLI 与可配置命令治理方案图
+flowchart TB
+  coding_agent(["本机 Coding Agent"])
+  agent_skill["Agent 技能指南\ncli/SKILL.md\n命令发现与闭环使用规范"]:::added
+  cli_entry["CLI 主入口与裁剪\ncli/main.py\n动态命令树与统一输出"]:::added
+  legacy_cli["兼容命令行入口\nbackend/cli.py\n转发至cli统一入口"]:::changed
+  cli_policy["命令权限策略引擎\ncli/policy.py\n按配置筛选允许命令"]:::added
+  policy_file[("策略配置文件\ncli/policy.default.yaml\n预设档案与黑白名单")]:::added
+  cli_commands["全量命令组\ncli/commands\n覆盖7大模块57条API"]:::added
+  cli_client["平台薄HTTP客户端\ncli/client.py\nHTTP与ASGI双模"]:::added
+  fastapi_app["FastAPI 后端服务\nbackend/app/main.py"]
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db")]
+
+  coding_agent -->|"读技能按需查help"| agent_skill
+  coding_agent -->|"执行evalctl命令"| cli_entry
+  legacy_cli -->|"兼容转发"| cli_entry
+  cli_entry -->|"加载策略裁剪命令"| cli_policy
+  cli_policy -->|"读取YAML/JSON配置"| policy_file
+  cli_entry -->|"路由至启用命令"| cli_commands
+  cli_commands -->|"封装请求与轮询"| cli_client
+  cli_client -->|"HTTP/SSE或ASGI调用"| fastapi_app
+  fastapi_app -->|"复用ORM锁与任务库"| sqlite_db

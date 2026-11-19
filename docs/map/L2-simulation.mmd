@@ -1,0 +1,35 @@
+%% title: 模拟对弈纵向切片 (L2)
+%% link: adapters -> L2-adapters.mmd
+%% link: judge_engine -> L2-judge_engine.mmd
+%% link: flywheel_service -> L2-flywheel.mmd
+%% link: api_flywheel -> L2-flywheel.mmd
+flowchart TB
+  simulation["模拟对弈\nfrontend/src/pages/SimulationArena.tsx\n含Mermaid/MonacoDiff/RequestDebug组件"]
+  api_sim["模拟对弈路由\nbackend/app/api/simulation.py\n复用deps加载模型与规则"]
+
+  subgraph sg_sim_core["模拟对弈核心"]
+    simulation_service["对弈调度服务\nbackend/app/services/simulation_service.py:SimulationService"]
+    simulator["客户模拟引擎\nbackend/app/engine/simulator.py:UniversalSimulator"]
+  end
+
+  subgraph sg_flywheel_boundary["跨模块委派至飞轮 (点击下钻，不展开内部)"]
+    flywheel_service["飞轮编排服务\nbackend/app/services/flywheel_service.py:FlywheelPipelineService\n跨模块委派 · 点击进飞轮"]
+    api_flywheel["飞轮API路由\nbackend/app/api/flywheel.py\n跨模块调用 · 点击进飞轮"]
+  end
+
+  judge_engine["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine"]
+  prompt_registry["提示词注册底座\nbackend/app/engine/prompt_registry.py"]
+  adapters["统一模型接入底座\nbackend/app/adapters"]
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\nFlywheelSampleRecord/PromptTemplateRecord/RegisteredModel/RuleConfigRecord")]
+
+  simulation -->|"SSE对弈/评估/历史"| api_sim
+  simulation -.->|"删除/Diff保存"| api_flywheel
+  api_sim -->|"多轮双Agent对弈"| simulation_service
+  api_sim -->|"自由对练初检"| judge_engine
+  api_sim -.->|"auto_remediate委派"| flywheel_service
+  simulation_service -->|"客户角色扮演"| simulator
+  simulation_service -->|"对弈结束初检"| judge_engine
+  simulator -->|"读取客户模拟模板"| prompt_registry
+  prompt_registry -->|"读取PromptTemplateRecord"| sqlite_db
+  sg_sim_core -->|"模型推理"| adapters
+  api_sim -->|"读写ORM表与data/rules"| sqlite_db

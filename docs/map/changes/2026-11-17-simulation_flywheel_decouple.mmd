@@ -1,0 +1,24 @@
+%% title: 模拟对弈与数据飞轮职责解耦改动方案图
+flowchart TB
+  sim_arena["模拟对弈页\nfrontend/src/pages/SimulationArena.tsx\n切换对弈API客户端"]:::changed
+  flywheel_page["飞轮工作台\nfrontend/src/pages/FlywheelWorkbench.tsx\n对齐待复核状态语义"]:::changed
+  fe_sim_api["前端对弈客户端\nfrontend/src/api/index.ts:simulationApi\n新增独立对弈API导出"]:::added
+  api_init["路由总装配\nbackend/app/api/__init__.py\n挂载对弈与飞轮双路由"]:::changed
+  api_sim["模拟对弈路由\nbackend/app/api/simulation.py\n承载对弈与评估5个接口"]:::added
+  api_flywheel["飞轮治理路由\nbackend/app/api/flywheel.py\n剥离对弈仅留治理导出"]:::changed
+  api_deps["路由公共依赖\nbackend/app/api/deps.py\n抽离模型与规则加载"]:::added
+  old_persist["重复落库分支\nbackend/app/api/flywheel.py:_persist_simulation_sample\n移除重复治理逻辑"]:::removed
+  sim_service["对弈调度服务\nbackend/app/services/simulation_service.py:SimulationService"]
+  flywheel_service["飞轮编排服务\nbackend/app/services/flywheel_service.py:FlywheelPipelineService\n统一初检与免修落库"]:::changed
+
+  sim_arena -->|"对弈/评估/历史"| fe_sim_api
+  fe_sim_api -->|"HTTP/SSE"| api_sim
+  flywheel_page -->|"样本治理/重检导出"| api_flywheel
+  api_init -->|"注册/simulation"| api_sim
+  api_init -->|"注册/flywheel"| api_flywheel
+  api_sim -->|"加载模型/规则"| api_deps
+  api_flywheel -->|"加载模型/规则"| api_deps
+  api_sim -->|"双Agent对弈"| sim_service
+  api_sim -->|"统一治理落库"| flywheel_service
+  api_flywheel -->|"批量/单条治理"| flywheel_service
+  api_flywheel -.->|"已剥离"| old_persist

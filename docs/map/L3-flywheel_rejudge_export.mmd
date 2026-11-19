@@ -1,0 +1,30 @@
+%% title: 数据飞轮复核重检重修与切题导出时序图 (L3)
+sequenceDiagram
+  participant flywheel as "数据飞轮<br/>frontend/src/pages/FlywheelWorkbench.tsx"
+  participant api_flywheel as "飞轮API路由<br/>backend/app/api/flywheel.py"
+  participant flywheel_service as "飞轮编排服务<br/>backend/app/services/flywheel_service.py:FlywheelPipelineService"
+  participant judge_engine as "质检裁判引擎<br/>backend/app/engine/judge.py:UniversalJudgeEngine"
+  participant remediator as "数据修复引擎<br/>backend/app/engine/remediator.py:UniversalDataRemediator"
+  participant slicer as "渐进切题引擎<br/>backend/app/engine/slicer.py:ProgressiveContextSlicer"
+  participant sqlite_db as "SQLite 元数据库<br/>data/eval_platform.db"
+
+  flywheel->>api_flywheel: POST /samples/{id}/judge (按新规则只检不修)
+  api_flywheel->>flywheel_service: judge_dialogue(只检不修评估)
+  flywheel_service->>judge_engine: evaluate_dialogue(拓扑+FAQ双轨质检)
+  judge_engine-->>flywheel_service: InspectionReport(扣分明细 deductions)
+  flywheel_service-->>api_flywheel: 返回报告与状态判定(resolve_rejudge_status)
+  api_flywheel->>sqlite_db: 更新 FlywheelSampleRecord 状态与评分
+  flywheel->>api_flywheel: POST /samples/{id}/remediate (触发声明式修复)
+  api_flywheel->>flywheel_service: process_single_dialogue_record(单次重塑+验收)
+  flywheel_service->>remediator: remediate_dialogue_with_actions(prune/replace)
+  remediator-->>flywheel_service: 修复对话与操作处方单
+  flywheel_service->>judge_engine: evaluate_dialogue(二次质检验收)
+  flywheel_service->>slicer: slice_dialogue(生成靶向评测切片)
+  flywheel_service-->>api_flywheel: FlywheelRecord(含修复语料、动作与切片)
+  api_flywheel->>sqlite_db: 更新修复语料、切片与状态
+  flywheel->>api_flywheel: PUT /samples/{id}/slices (微调切片标答)
+  api_flywheel->>flywheel_service: sync_slices_to_dialogue(双向同步重放)
+  flywheel_service->>remediator: apply_remediation_actions & 格式清洗校验
+  api_flywheel->>sqlite_db: 同步回写 applied_actions 与 remediated_messages
+  flywheel->>api_flywheel: POST /export-benchmark (导出Holdout评测集)
+  api_flywheel->>sqlite_db: 写DatasetRecord/Holdout标记并重置账本

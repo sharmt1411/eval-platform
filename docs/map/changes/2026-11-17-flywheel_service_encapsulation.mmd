@@ -1,0 +1,19 @@
+%% title: 飞轮路由瘦身与服务层统一封装方案图
+flowchart TB
+  flywheel_page["飞轮工作台\nfrontend/src/pages/FlywheelWorkbench.tsx"]
+  api_flywheel["飞轮治理路由\nbackend/app/api/flywheel.py\n收薄路由移除直连三引擎"]:::changed
+  flywheel_service["飞轮编排服务\nbackend/app/services/flywheel_service.py:FlywheelPipelineService\n统一封装重检切片与同步"]:::changed
+  remediator["数据修复引擎\nbackend/app/engine/remediator.py:UniversalDataRemediator\n暴露公共轮次解析方法"]:::changed
+  judge_engine["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine"]
+  slicer["渐进切题引擎\nbackend/app/engine/slicer.py:ProgressiveContextSlicer"]
+  benchmark_sampler["抽样与账本引擎\nbackend/app/engine/benchmark_sampler.py:BenchmarkSamplingEngine\n提至顶层并合并导出逻辑"]:::changed
+  old_dup["路由直调与重复切题\nbackend/app/api/flywheel.py\n移除3处切题与私有调用"]:::removed
+
+  flywheel_page -->|"重检/修复/切片/导出"| api_flywheel
+  api_flywheel -->|"统一委派治理切题同步"| flywheel_service
+  api_flywheel -->|"顶层导入与账本重置"| benchmark_sampler
+  flywheel_service -->|"只检不修与二检"| judge_engine
+  flywheel_service -->|"修复回放与格式校验"| remediator
+  flywheel_service -->|"统一生成测评切片"| slicer
+  slicer -->|"格式清洗校验"| remediator
+  api_flywheel -.->|"已剥离直连"| old_dup

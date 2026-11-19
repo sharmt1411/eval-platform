@@ -1,0 +1,20 @@
+%% title: 提示词管理中心解耦与业务侧调试收口变更图
+flowchart TB
+  prompt_center["提示词管理中心\nfrontend/src/pages/PromptCenter.tsx\n专注全局模板治理与静态预览"]:::changed
+  rule_center["规则中心\nfrontend/src/pages/RuleCenter.tsx\n支持7类规则/对弈Prompt及草稿覆盖"]:::changed
+  bench_list["常规评测工作台\nfrontend/src/pages/BenchmarkList.tsx\n新增基于真实样本的裁判Prompt调试"]:::changed
+  api_prompts["提示词管理路由\nbackend/app/api/prompts.py\n剥离引擎/规则/模型，仅留CRUD与预览"]:::changed
+  api_rules["规则中心路由\nbackend/app/api/rules.py\n补齐plain/simulator与动态拓扑推导"]:::changed
+  api_benchmarks["常规评测路由\nbackend/app/api/benchmarks.py\n新增benchmark_judge组装与实测接口"]:::changed
+  prompt_registry["提示词注册底座\nbackend/app/engine/prompt_registry.py\n内存缓存与静态占位符预览"]:::changed
+  judge_engine["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine\n修复闭Mermaid泄漏并统一变量渲染"]:::changed
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\nPromptTemplateRecord")]
+
+  prompt_center -->|"模板编辑/重置/静态预览"| api_prompts
+  api_prompts -->|"读写激活模板与静态校验"| prompt_registry
+  rule_center -->|"7类Prompt组装与实测"| api_rules
+  bench_list -->|"常规评测裁判Prompt调试"| api_benchmarks
+  api_rules -->|"组装与试跑质检/对弈"| judge_engine
+  api_benchmarks -->|"组装与试跑裁判Prompt"| judge_engine
+  judge_engine -->|"读取激活提示词(缓存)"| prompt_registry
+  prompt_registry -->|"读写PromptTemplateRecord"| sqlite_db

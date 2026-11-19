@@ -1,0 +1,90 @@
+@import "tailwindcss";
+
+@theme {
+  --text-3xs: 0.625rem;
+  --text-2xs: 0.6875rem;
+  --shadow-2xs: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+}
+
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Code block highlight */
+pre, code {
+  font-family: 'Fira Code', Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+}
+
+
+/* Ant Design Tabs 全高度自适应与弹性内部滚动 */
+.rule-center-tabs.ant-tabs,
+.h-full-tabs.ant-tabs {
+  display: flex !important;
+  flex-direction: column !important;
+  height: 100% !important;
+  min-height: 0 !important;
+  flex: 1 1 0% !important;
+}
+
+.rule-center-tabs > .ant-tabs-nav,
+.h-full-tabs > .ant-tabs-nav {
+  margin-bottom: 8px !important;
+  flex-shrink: 0 !important;
+}
+
+/* 兼容 AntD 5 的 body-holder 与 content-holder */
+.rule-center-tabs .ant-tabs-body-holder,
+.rule-center-tabs .ant-tabs-content-holder,
+.h-full-tabs .ant-tabs-body-holder,
+.h-full-tabs .ant-tabs-content-holder {
+  flex: 1 1 0% !important;
+  min-height: 0 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden !important;
+  height: 100% !important;
+}
+
+.rule-center-tabs .ant-tabs-body,
+.rule-center-tabs .ant-tabs-content:not([role="tabpanel"]),
+.h-full-tabs .ant-tabs-body,
+.h-full-tabs .ant-tabs-content:not([role="tabpanel"]) {
+  flex: 1 1 0% !important;
+  height: 100% !important;
+  min-height: 0 !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+/* Tabpanel 滚动容器 */
+.rule-center-tabs [role="tabpanel"],
+.rule-center-tabs .ant-tabs-content-active,
+.rule-center-tabs .ant-tabs-tabpane-active,
+.h-full-tabs [role="tabpanel"],
+.h-full-tabs .ant-tabs-content-active,
+.h-full-tabs .ant-tabs-tabpane-active {
+  flex: 1 1 0% !important;
+  height: 100% !important;
+  min-height: 0 !important;
+  overflow-y: auto !important;
+  padding-right: 6px !important;
+}

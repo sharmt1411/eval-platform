@@ -1,0 +1,33 @@
+%% title: Agent CLI 与权限治理内部图 (L2)
+%% link: api_models -> L2-model_hub.mmd
+%% link: api_rules -> L2-rule_center.mmd
+%% link: api_prompts -> L2-prompt_center.mmd
+%% link: api_datasets -> L2-dataset_center.mmd
+%% link: api_benchmarks -> L2-benchmark.mmd
+%% link: api_sim -> L2-simulation.mmd
+%% link: api_flywheel -> L2-flywheel.mmd
+flowchart TB
+  cli["Agent CLI 入口\ncli/main.py\n含SKILL与兼容入口backend/cli.py"]
+  cli_policy["命令权限策略引擎\ncli/policy.py\n读policy.default.yaml裁剪"]
+  cli_commands["全量命令组\ncli/commands\n8组59条命令"]
+  cli_client["平台薄HTTP客户端\ncli/client.py\nHTTP与ASGI双模"]
+  fastapi_app["FastAPI 后端服务\nbackend/app/main.py"]
+  api_models["模型管理路由\nbackend/app/api/models.py"]
+  api_rules["规则中心路由\nbackend/app/api/rules.py"]
+  api_prompts["提示词管理路由\nbackend/app/api/prompts.py"]
+  api_datasets["数据集路由\nbackend/app/api/datasets.py"]
+  api_benchmarks["评测路由\nbackend/app/api/benchmarks.py"]
+  api_sim["模拟对弈路由\nbackend/app/api/simulation.py"]
+  api_flywheel["飞轮API路由\nbackend/app/api/flywheel.py"]
+
+  cli -->|"策略裁剪"| cli_policy
+  cli -->|"路由分发"| cli_commands
+  cli_commands -->|"封装请求"| cli_client
+  cli_client -->|"health检查"| fastapi_app
+  cli_client -->|"model(6)"| api_models
+  cli_client -->|"rule(6)"| api_rules
+  cli_client -->|"prompt(5)"| api_prompts
+  cli_client -->|"dataset(7)"| api_datasets
+  cli_client -->|"benchmark(11)"| api_benchmarks
+  cli_client -->|"simulation(5)"| api_sim
+  cli_client -->|"flywheel(16)"| api_flywheel

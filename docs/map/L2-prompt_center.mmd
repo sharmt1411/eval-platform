@@ -1,0 +1,10 @@
+%% title: 提示词管理中心纵向切片 (L2)
+flowchart TB
+  prompt_center["提示词中心\nfrontend/src/pages/PromptCenter.tsx\n含promptDebugExport导出工具"]
+  api_prompts["提示词管理路由\nbackend/app/api/prompts.py\n仅管模板CRUD与静态预览"]
+  prompt_registry["提示词注册底座\nbackend/app/engine/prompt_registry.py\n全局激活模板与缓存管理"]
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\nPromptTemplateRecord")]
+
+  prompt_center -->|"模板编辑/对比/静态预览"| api_prompts
+  api_prompts -->|"读写激活模板与校验"| prompt_registry
+  prompt_registry -->|"读写PromptTemplateRecord"| sqlite_db

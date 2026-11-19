@@ -1,0 +1,19 @@
+%% title: Vertex模型注册自适应探测与思考协议持久化方案图
+flowchart TB
+  model_hub["模型中心\nfrontend/src/pages/ModelHub.tsx\n展示思考协议与重新探测"]:::changed
+  api_models["模型管理路由\nbackend/app/api/models.py\n注册更新测试自动探测落库"]:::changed
+  api_deps["路由模型加载助手\nbackend/app/api/deps.py\n透传已存思考协议给工厂"]
+  api_benchmarks["常规评测路由\nbackend/app/api/benchmarks.py\n补齐裁判模型config透传"]:::changed
+  adapter_factory["适配器工厂\nbackend/app/adapters/factory.py:AdapterFactory\n保留thinking_mode透传"]:::changed
+  vertex_adapter["Vertex AI适配器\nbackend/app/adapters/vertex_adapter.py:VertexGeminiAdapter\n双协议探测与OpenAI MaaS路由"]:::changed
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\nRegisteredModel.config_json存思考协议")]
+  ext_vertex(["Vertex Gemini & MaaS 服务"])
+
+  model_hub -->|"注册/编辑/测试/探测"| api_models
+  api_models -->|"调用detect_thinking_mode"| vertex_adapter
+  api_models -->|"存储vertex_thinking_mode"| sqlite_db
+  api_deps -->|"读取config创建适配器"| adapter_factory
+  api_benchmarks -->|"透传裁判config"| adapter_factory
+  adapter_factory -->|"注入thinking_mode"| vertex_adapter
+  vertex_adapter -->|"Probe A: Gemini原生"| ext_vertex
+  vertex_adapter -->|"Probe B/C: MaaS OpenAI"| ext_vertex

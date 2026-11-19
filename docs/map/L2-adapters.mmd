@@ -1,0 +1,21 @@
+%% title: 统一模型接入底座内部图 (L2)
+flowchart TB
+  adapter_factory["适配器工厂\nbackend/app/adapters/factory.py:AdapterFactory"]
+  openai_adapter["OpenAI兼容适配器\nbackend/app/adapters/openai_adapter.py:OpenAIAdapter"]
+  harmony_adapter["Harmony双通道适配器\nbackend/app/adapters/harmony_adapter.py:HarmonyAdapter"]
+  vertex_adapter["Vertex AI适配器\nbackend/app/adapters/vertex_adapter.py:VertexGeminiAdapter"]
+  mock_adapter["离线Mock适配器\nbackend/app/adapters/mock_adapter.py:MockAdapter"]
+  adapter_base["抽象基类与思考剥离\nbackend/app/adapters/base.py:BaseModelAdapter"]
+  ext_llm(["外部大模型服务"])
+
+  adapter_factory -->|"provider=openai"| openai_adapter
+  adapter_factory -->|"provider=harmony"| harmony_adapter
+  adapter_factory -->|"provider=vertex"| vertex_adapter
+  adapter_factory -->|"provider=mock"| mock_adapter
+  openai_adapter -->|"继承5次重试与思考剥离"| adapter_base
+  harmony_adapter -->|"继承与channel剥离"| adapter_base
+  vertex_adapter -->|"ADC/代理/思考协议探测"| adapter_base
+  mock_adapter -->|"继承本地模拟"| adapter_base
+  openai_adapter -->|"HTTP Chat/Completions"| ext_llm
+  harmony_adapter -->|"HTTP Harmony通道"| ext_llm
+  vertex_adapter -->|"Gemini原生/MaaS端点"| ext_llm

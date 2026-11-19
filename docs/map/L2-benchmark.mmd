@@ -1,0 +1,27 @@
+%% title: 常规评测纵向切片 (L2)
+%% link: adapters -> L2-adapters.mmd
+%% link: judge_engine -> L2-judge_engine.mmd
+flowchart TB
+  benchmark["常规评测\nfrontend/src/pages/BenchmarkList.tsx"]
+  benchmark_report["评测对比报告\nfrontend/src/pages/BenchmarkReport.tsx\n含MetricRadarChart雷达图"]
+  api_benchmarks["评测路由\nbackend/app/api/benchmarks.py"]
+  benchmark_runner["评测矩阵执行器\nbackend/app/engine/benchmark_runner.py:BenchmarkRunner"]
+  benchmark_sampler["抽样与账本引擎\nbackend/app/engine/benchmark_sampler.py:BenchmarkSamplingEngine"]
+  judge_engine["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine"]
+  adapters["统一模型接入底座\nbackend/app/adapters"]
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\nTaskRecord/RegisteredModel/DatasetRecord/BenchmarkRunLedger")]
+  runs_dir[("本地评测数据与报告\ndata/runs\n含data/datasets题库只读")]
+
+  benchmark -->|"发起/抽样预览/裁判调试"| api_benchmarks
+  benchmark_report -->|"轮询进度/对比详情/撤销账本"| api_benchmarks
+  api_benchmarks -->|"动态阶梯抽样/入账/撤销"| benchmark_sampler
+  api_benchmarks -->|"异步多模型矩阵评测"| benchmark_runner
+  api_benchmarks -->|"调试与实测裁判Prompt"| judge_engine
+  api_benchmarks -->|"读写Task与Model表"| sqlite_db
+  api_benchmarks -->|"步进落盘/读取报告"| runs_dir
+  benchmark_runner -->|"主观Rubric打分"| judge_engine
+  benchmark_runner -->|"记录样本结果与指纹"| benchmark_sampler
+  benchmark_runner -->|"模型推理"| adapters
+  judge_engine -->|"裁判推理"| adapters
+  benchmark_sampler -->|"读写BenchmarkRunLedger"| sqlite_db
+  benchmark_sampler -->|"读取题库与样本指纹"| runs_dir

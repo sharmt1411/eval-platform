@@ -1,0 +1,35 @@
+%% title: AI模拟对弈与质检修复切题闭环时序图 (L3)
+sequenceDiagram
+  participant simulation as "模拟对弈<br/>frontend/src/pages/SimulationArena.tsx"
+  participant api_sim as "模拟对弈路由<br/>backend/app/api/simulation.py"
+  participant simulation_service as "对弈调度服务<br/>backend/app/services/simulation_service.py:SimulationService"
+  participant simulator as "客户模拟引擎<br/>backend/app/engine/simulator.py:UniversalSimulator"
+  participant flywheel_service as "飞轮编排服务<br/>backend/app/services/flywheel_service.py:FlywheelPipelineService"
+  participant judge_engine as "质检裁判引擎<br/>backend/app/engine/judge.py:UniversalJudgeEngine"
+  participant remediator as "数据修复引擎<br/>backend/app/engine/remediator.py:UniversalDataRemediator"
+  participant sqlite_db as "SQLite 元数据库<br/>data/eval_platform.db"
+
+  simulation->>api_sim: POST /simulation/simulate/stream
+  api_sim->>sqlite_db: 经 deps 读取模型与规则配置
+  api_sim->>simulation_service: run_battle_iter(启动双Agent对弈)
+  loop 多轮实战交互直至挂机或超限
+    simulation_service->>simulator: generate_reply(角色反转+静态System)
+    simulator-->>simulation_service: 客户回复
+    simulation_service-->>api_sim: yield ('turn', ChatMessage)
+    api_sim-->>simulation: SSE 实时推流气泡
+  end
+  simulation_service->>judge_engine: evaluate_dialogue(对弈结束白盒初检)
+  judge_engine-->>simulation_service: InspectionReport(轨迹+扣分项)
+  simulation_service-->>api_sim: yield ('done', battle_result)
+  api_sim->>flywheel_service: process_single_dialogue_record(复用初检+auto_remediate)
+  alt auto_remediate=False 且未直通
+    flywheel_service-->>api_sim: FlywheelRecord(PENDING+首轮system)
+  else auto_remediate=True 且未直通
+    flywheel_service->>remediator: remediate_dialogue_with_actions(单次修复)
+    remediator-->>flywheel_service: remediated_messages + applied_actions
+    flywheel_service->>judge_engine: evaluate_dialogue(二次质检验收)
+    judge_engine-->>flywheel_service: verified_eval(REPAIRED_PASS/DISCARDED)
+    flywheel_service-->>api_sim: FlywheelRecord(含渐进切题slices)
+  end
+  api_sim->>sqlite_db: _persist_flywheel_record 写入 FlywheelSampleRecord
+  api_sim-->>simulation: SSE 返回最终落库样本与诊断报告

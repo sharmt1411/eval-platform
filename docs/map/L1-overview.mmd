@@ -1,0 +1,39 @@
+%% title: 系统架构全景图 (L1)
+%% link: cli -> L2-cli.mmd
+%% link: sqlite_db -> L2-dataset_center.mmd
+flowchart TB
+  cli["Agent CLI 入口\ncli/main.py"]
+
+  subgraph sg_caps["七大业务能力工作台"]
+    direction LR
+    model_hub["模型中心\nfrontend/src/pages/ModelHub.tsx"]
+    dataset_center["数据集中心\nfrontend/src/pages/DatasetCenter.tsx"]
+    prompt_center["提示词中心\nfrontend/src/pages/PromptCenter.tsx"]
+    subgraph sg_judge_users["核心评测与飞轮工作台"]
+      direction LR
+      rule_center["规则中心\nfrontend/src/pages/RuleCenter.tsx"]
+      benchmark["常规评测\nfrontend/src/pages/BenchmarkList.tsx"]
+      simulation["模拟对弈\nfrontend/src/pages/SimulationArena.tsx"]
+      flywheel["数据飞轮\nfrontend/src/pages/FlywheelWorkbench.tsx"]
+    end
+  end
+
+  subgraph sg_infra["共用底座与外网直连"]
+    judge_engine["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine\n含topology与faq_retriever外网直连"]
+    adapters["统一模型接入底座\nbackend/app/adapters"]
+    sqlite_db[("SQLite 元数据库\ndata/eval_platform.db")]
+  end
+
+  ext_services(["外部大模型与 Embedding 服务"])
+
+  cli -->|"全量API(HTTP/ASGI)"| sg_caps
+
+  model_hub --> adapters
+  sg_judge_users -->|"质检与Rubric打分"| judge_engine
+  sg_judge_users -->|"业务模型推理"| adapters
+  judge_engine -->|"裁判推理"| adapters
+  simulation -->|"样本入飞轮治理池"| flywheel
+
+  adapters -->|"统一调用与重试"| ext_services
+  judge_engine -.->|"⚠️faq_retriever直连"| ext_services
+  sg_caps -->|"读写ORM表与data目录"| sqlite_db

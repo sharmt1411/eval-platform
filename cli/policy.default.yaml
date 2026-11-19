@@ -1,0 +1,134 @@
+# -*- coding: utf-8 -*-
+# 通用大模型测试管理与数据飞轮平台 CLI 默认策略配置
+# 可通过 `--config <file>`、环境变量 `EVALCTL_POLICY_FILE` 或当前目录下的 `evalctl.policy.yaml` 覆盖。
+version: 1
+active_profile: full
+
+defaults:
+  base_url: http://127.0.0.1:9021
+  timeout_seconds: 600
+
+profiles:
+  full:
+    description: "全能力模式：开放全部 8 个命令组共 59 条命令，供本机 Coding Agent 完整调度。"
+    enabled_groups:
+      - system
+      - model
+      - rule
+      - prompt
+      - dataset
+      - benchmark
+      - simulation
+      - flywheel
+    allowed_risks:
+      - read
+      - run
+      - write
+      - destructive
+    allow:
+      - "*"
+    deny: []
+    require_confirm_for_destructive: false
+
+  safe:
+    description: "安全模式：支持全部读取、运行与配置修改能力，禁用删除与账本重置类高危命令。"
+    enabled_groups:
+      - system
+      - model
+      - rule
+      - prompt
+      - dataset
+      - benchmark
+      - simulation
+      - flywheel
+    allowed_risks:
+      - read
+      - run
+      - write
+    allow:
+      - "*"
+    deny:
+      - "*.delete"
+      - "*.batch-delete"
+      - "simulation.clear-all"
+      - "benchmark.reset-tracker"
+    require_confirm_for_destructive: true
+
+  readonly:
+    description: "只读诊断模式：仅允许查询、预览与 Prompt 静态/组装检查，不产生任何修改或模型推理。"
+    enabled_groups:
+      - system
+      - model
+      - rule
+      - prompt
+      - dataset
+      - benchmark
+      - simulation
+      - flywheel
+    allowed_risks:
+      - read
+    allow:
+      - "*"
+    deny: []
+    require_confirm_for_destructive: true
+
+  eval-loop:
+    description: "评测调优闭环模式：聚焦模型连通/对话、规则与提示词修改、数据集管理及常规对比评测。"
+    enabled_groups:
+      - system
+      - model
+      - rule
+      - prompt
+      - dataset
+      - benchmark
+    allowed_risks:
+      - read
+      - run
+      - write
+    allow:
+      - "system.*"
+      - "model.list"
+      - "model.test"
+      - "model.chat"
+      - "rule.*"
+      - "prompt.*"
+      - "dataset.*"
+      - "benchmark.*"
+    deny:
+      - "*.delete"
+      - "*.batch-delete"
+      - "benchmark.reset-tracker"
+    require_confirm_for_destructive: true
+
+  flywheel-loop:
+    description: "飞轮治理闭环模式：聚焦模拟对弈、白盒质检、微创修复、切题与数据集导出。"
+    enabled_groups:
+      - system
+      - model
+      - rule
+      - prompt
+      - dataset
+      - benchmark
+      - simulation
+      - flywheel
+    allowed_risks:
+      - read
+      - run
+      - write
+    allow:
+      - "system.*"
+      - "model.list"
+      - "model.test"
+      - "rule.*"
+      - "prompt.*"
+      - "dataset.list"
+      - "dataset.samples"
+      - "dataset.import"
+      - "benchmark.status"
+      - "simulation.*"
+      - "flywheel.*"
+    deny:
+      - "*.delete"
+      - "*.batch-delete"
+      - "simulation.clear-all"
+    require_confirm_for_destructive: true

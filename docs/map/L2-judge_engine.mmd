@@ -1,0 +1,17 @@
+%% title: 质检裁判底座内部图 (L2)
+%% link: adapters -> L2-adapters.mmd
+flowchart TB
+  judge_engine["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine\n两步轨迹抽取与Rubric打分"]
+  topology_validator["拓扑校验器\nbackend/app/engine/topology.py:UniversalTopologyValidator"]
+  faq_retriever["FAQ检索引擎\nbackend/app/engine/faq_retriever.py:UniversalFAQRetriever"]
+  prompt_registry["提示词注册底座\nbackend/app/engine/prompt_registry.py"]
+  adapters["统一模型接入底座\nbackend/app/adapters"]
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\n表: PromptTemplateRecord")]
+  ext_embed(["外部 Embedding 服务"])
+
+  judge_engine -->|"SOP槽位连通校验"| topology_validator
+  judge_engine -->|"BM25+向量RRF检索"| faq_retriever
+  judge_engine -->|"读取激活提示词"| prompt_registry
+  judge_engine -->|"两步抽取与裁判推理"| adapters
+  prompt_registry -->|"读取PromptTemplateRecord"| sqlite_db
+  faq_retriever -.->|"⚠️requests.post直连"| ext_embed

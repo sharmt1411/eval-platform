@@ -1,0 +1,33 @@
+%% title: 数据飞轮纵向切片 (L2)
+%% link: adapters -> L2-adapters.mmd
+%% link: judge_engine -> L2-judge_engine.mmd
+flowchart TB
+  flywheel["数据飞轮\nfrontend/src/pages/FlywheelWorkbench.tsx\n含TurnDiff/MonacoDiff/RequestDebug组件"]
+
+  subgraph sg_ledger["飞轮治理路由与账本隔离"]
+    api_flywheel["飞轮API路由\nbackend/app/api/flywheel.py\n收薄路由仅做HTTP编排与落库"]
+    benchmark_sampler["抽样与账本引擎\nbackend/app/engine/benchmark_sampler.py:BenchmarkSamplingEngine"]
+  end
+
+  subgraph sg_ai_exec["飞轮 AI 修复与清洗层"]
+    flywheel_service["飞轮编排服务\nbackend/app/services/flywheel_service.py:FlywheelPipelineService"]
+    remediator["数据修复引擎\nbackend/app/engine/remediator.py:UniversalDataRemediator"]
+  end
+
+  slicer["渐进切题引擎\nbackend/app/engine/slicer.py:ProgressiveContextSlicer"]
+  judge_engine["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine"]
+  prompt_registry["提示词注册底座\nbackend/app/engine/prompt_registry.py"]
+  adapters["统一模型接入底座\nbackend/app/adapters"]
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\nFlywheelSampleRecord/TaskRecord/DatasetRecord/BenchmarkRunLedger/PromptTemplateRecord/RegisteredModel/RuleConfigRecord")]
+
+  flywheel -->|"复核/重检/重修/导出"| api_flywheel
+  api_flywheel -->|"治理/重检/切片同步"| flywheel_service
+  api_flywheel -->|"防泄漏与Holdout"| benchmark_sampler
+  flywheel_service -->|"初检/二检/只检不修"| judge_engine
+  flywheel_service -->|"AI修复/重放校验"| remediator
+  flywheel_service -->|"生成/补切评测切片"| slicer
+  slicer -->|"格式清洗校验"| remediator
+  remediator -->|"读取激活修复模板"| prompt_registry
+  prompt_registry -->|"读取PromptTemplateRecord"| sqlite_db
+  sg_ai_exec -->|"模型推理"| adapters
+  sg_ledger -->|"读写ORM表与data目录"| sqlite_db
