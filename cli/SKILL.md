@@ -7,21 +7,46 @@ description: 通过统一命令行工具 evalctl（或 python -m cli / python ba
 
 本指南面向本机 Coding Agent，采用**渐进式披露**方式按需探索并调用平台全部 8 大能力模块（61 条命令）。
 
-## 一、快速入口、语法约束与路径语义
+## 一、环境检测、下载启动与路径语义
 
-### 1. 标准入口与传输模式
-- 全文示例统一使用全局命令 `evalctl`（若当前环境未安装包，可在平台源码根目录用 `python -m cli` 替代）。
-- **默认 HTTP 模式**：连接运行中的 FastAPI 后端 `:9021`（可通过 `--base-url` 或环境变量 `EVALCTL_BASE_URL` 指定），与 Web 工作台共享数据库与产物。
-- **进程内模式 `--in-process`**：本地未启动 `:9021` 服务时，加全局参数 `--in-process` 通过 ASGI 直调后端（`evalctl --in-process system health`）。
+### 1. 检测本地 CLI 与服务状态（先查后动）
+- **检测 CLI 命令**：运行 `evalctl --help`（若未全局安装但在源码根目录，可用 `python -m cli --help` 或 `python backend/cli.py --help` 替代）。
+- **检测本地 `:9021` 后端服务**：
+  ```bash
+  evalctl system health
+  ```
+  - 返回 `{"status": "healthy", ...}`（退出码 `0`）：本地服务已运行，直接使用默认 HTTP 模式即可（与 Web 工作台共享 SQLite 数据库与产物）。
+  - 返回退出码 `2`（连接失败）：说明本地 `:9021` 服务未启动。**纯 CLI 调测可直接加全局参数 `--in-process`**（如 `evalctl --in-process system health`）通过 ASGI 进程内直调后端，无需强行起服务；**需要长驻服务或联用 Web 工作台时**，按第 3 步提示用户启动服务。
 
-### 2. 全局参数语法硬约束（必看）
+### 2. 下载与安装（当前环境尚未部署时）
+- **安装源仓库**：`https://github.com/sharmt1411/eval-platform.git`（要求 Python `>= 3.10`；若启动前端 Web 工作台另需 Node.js `>= 18`）。
+  ```bash
+  git clone https://github.com/sharmt1411/eval-platform.git
+  cd eval-platform
+  pip install -r backend/requirements.txt
+  pip install -e .
+  ```
+- 若仅在外部项目中安装 CLI 客户端连接远端 HTTP 服务（不本地起后端或走 `--in-process`），也可单独安装：`pip install "git+https://github.com/sharmt1411/eval-platform.git"`。
+- 若使用 Google Vertex AI 模型，需在本机先完成 ADC 鉴权（`gcloud auth application-default login`），并在环境变量或模型配置中指定 Project ID 与 Location。
+
+### 3. 启动本地服务（长期运行服务需由用户手动运行或获批后启动）
+```bash
+# 1. 启动后端 FastAPI 服务（默认监听 127.0.0.1:9021，API 文档 http://127.0.0.1:9021/docs）
+uvicorn backend.app.main:app --host 127.0.0.1 --port 9021 --reload
+
+# 2. 可选：启动前端 Web 工作台（默认监听 http://localhost:5173，反向代理 /api 至 9021）
+cd frontend && npm install && npm run dev
+```
+- **传输模式切换**：默认连接 `http://127.0.0.1:9021`，可通过全局 `--base-url` 或环境变量 `EVALCTL_BASE_URL` 指向其他后端地址；`--in-process` 仅建议在未启动 `:9021` 服务时使用，已有服务运行时优先走 HTTP 模式以免并发写库冲突。
+
+### 4. 全局参数语法硬约束（必看）
 ```text
 evalctl [全局参数] <group> <command> [子命令参数]
 ```
 - **所有全局参数必须置于子命令之前**，包括：`--out`、`--format`、`--timeout`、`--profile`、`--config`、`--base-url`、`--in-process`、`--yes`。放在子命令之后会导致 Click 解析报错。
 - 正确示例：`evalctl --out data/runs/sim.json --timeout 0 simulation stream ...`
 
-### 3. 跨项目调用的路径语义
+### 5. 跨项目调用的路径语义
 在外部业务仓库（如训练/微调项目目录）中运行 `evalctl` 时，请严格区分两类路径：
 - **客户端当前路径**（相对当前终端工作目录）：`dataset import --file`、`--payload`、`--out`、`--save-jsonl`、`--dialogue-file`、`--messages-file`、`--template-file`、`--assembled-prompt-file`。
 - **平台服务端路径**（相对平台仓库根目录或服务端绝对路径）：`benchmark run --dataset-path`、`flywheel batch --input-file-path`、`flywheel inspect-dataset --dataset-path`、`dataset import --source-file-path`。
@@ -103,9 +128,17 @@ evalctl --out data/runs/bench_judge.json benchmark debug-judge --dataset-path da
 evalctl benchmark test-judge --model-id vertex-gemini-flash-judge --payload data/runs/bench_judge.json
 ```
 
-### 闭环 3：双 Agent 模拟对弈 → 飞轮质检/修复 → 切题/导出 SFT 与评测集
+### 闭环 3：双 Agent 模拟对弈（含大模型/思考模式采样造数）→ 飞轮质检/修复 → 切题/导出 SFT 与评测集
+
+> **双用途提示**：模拟对弈既可用于**压测微调模型实战能力**，也常用于**冷启动/长尾造数**——把高性能老师模型或开启思考参数（`thinking_enabled: true`）的模型挂为 `--target-model-id` 直接对弈采样，后台会自动将每轮 `assistant` 的思考链 `thinking` 与正文剥离并一并入库，再经白盒质检与清洗导出高质量 SFT / CoT 蒸馏数据集。
+
 ```bash
+# 0.（可选：老师模型/思考模式采样造数时）开启目标模型思考参数，模拟客户侧保持 NONE/LOW 以兼顾速度与口语化
+evalctl model update <teacher_model_id> \
+  --config-json '{"thinking_enabled": true, "thinking_level": "HIGH", "max_tokens": 4096}'
+
 # 1. 流式运行对弈（进度打到 stderr；汇总 JSON 约 200KB+，务必加全局 --out 落盘）
+#    测模型或老师模型采样均通过 --target-model-id 指定；全剧本批量采样传 --scenario-id all
 evalctl --timeout 0 --out data/runs/sim_result.json simulation stream \
   --rule-id demo_after_sales \
   --target-model-id harmony-demo-target-model \
@@ -123,7 +156,11 @@ evalctl --timeout 0 flywheel remediate <sample_id> --remediate-model-id vertex-g
 evalctl flywheel slices-get <sample_id>
 
 # 4. 导出黄金 SFT 训练集（与留出评测集天然防泄漏隔离）或导出为 Benchmark 评测集
+#    注：如需导出采集到的 assistant 思考链用于 CoT 蒸馏，显式加 --inject-thinking（默认不导出）
+#    注：replace 修复仅改写 content 不会重生成 thinking，强 CoT 蒸馏建议优先筛选 GOLD_PASS 样本导出：
+#        evalctl flywheel export-selected --sample-id <id1> --sample-id <id2> --inject-thinking
 evalctl flywheel export-gold --rule-id demo_after_sales --version-tag v1.1
+evalctl flywheel export-gold --rule-id demo_after_sales --version-tag v1.1_cot --inject-thinking
 evalctl flywheel export-benchmark <sample_id> --dataset-id fw_eval_v1 --name "飞轮回归评测集"
 
 # 5. 批量飞轮治理（初检->AI修复->二检->gold/discarded；--input-file-path 为服务端路径）
