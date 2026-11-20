@@ -40,7 +40,7 @@ eval-platform/
 │   ├── __init__.py                                # CLI 包版本定义
 │   ├── __main__.py                                # python -m cli 调度入口
 │   ├── config.py                                  # 运行时配置、环境变量与统一退出码 (0/1/2/3/4)
-│   ├── catalog.py                                 # 全量 8 组 59 条命令目录契约（覆盖全部 57 条后端 API）
+│   ├── catalog.py                                 # 全量 8 组 61 条命令目录契约（覆盖全部 59 条后端 API）
 │   ├── policy.py                                  # 命令可见性与权限策略引擎（Profile/通配符黑白名单/风险分级/二次确认）
 │   ├── policy.default.yaml                        # 默认策略配置与 5 套预设 Profile (full/safe/readonly/eval-loop/flywheel-loop)
 │   ├── client.py                                  # 平台薄客户端（默认 HTTP/SSE 直连后端，可选 --in-process ASGI 直调）
@@ -56,7 +56,7 @@ eval-platform/
 │       ├── datasets.py                            # list / samples / import / delete / filter-options / export-preview / export (7)
 │       ├── benchmarks.py                          # run / tasks / status / side-by-side / delete / batch-delete / revoke-ledger / preview-sampling / reset-tracker / debug-judge / test-judge (11)
 │       ├── simulation.py                          # run / stream / recent / evaluate / clear-all (5)
-│       └── flywheel.py                            # samples / batch / judge / batch-judge / remediate / batch-remediate / update / batch-status / delete / batch-delete / slices-get / slices-update / export-gold / export-selected / export-benchmark / batch-export-benchmark (16)
+│       └── flywheel.py                            # samples / batch / inspect-dataset / inspect-report / judge / batch-judge / remediate / batch-remediate / update / batch-status / delete / batch-delete / slices-get / slices-update / export-gold / export-selected / export-benchmark / batch-export-benchmark (18)
 ├── docs/                                          # [统一设计与规范文档库]
 │   ├── DESIGN_PLAN.md                             # [架构方案] 通用测试管理与数据飞轮平台完整设计方案说明书
 │   ├── FRONTEND_DESIGN.md                         # [前端方案] Web 工作台信息架构、组件线框与交互规范说明书
@@ -87,7 +87,8 @@ eval-platform/
 │       │   ├── 2026-11-17-simulation_flywheel_decouple.mmd   # 模拟对弈与数据飞轮职责解耦方案/变更图
 │       │   ├── 2026-11-18-prompt_center_and_rule_prompt_debug.mmd # 规则中心轨迹/FAQ调试增强与提示词管理中心方案图
 │       │   ├── 2026-11-18-vertex_adaptive_thinking_probe.mmd # Vertex思考协议自适应探测与持久化方案/变更图
-│       │   └── 2026-11-19-agent_cli_platform.mmd  # 本机 Coding Agent CLI 与可配置命令治理方案/变更图
+│       │   ├── 2026-11-19-agent_cli_platform.mmd  # 本机 Coding Agent CLI 与可配置命令治理方案/变更图
+│       │   └── 2026-11-19-dataset_rule_inspection.mmd # 纯对话数据集批量规则质检打分与评测边界治理方案/变更图
 │       └── facts/                                 # [自动落盘事实库] 供 AI 与开发者查漏的持久化真相清单
 │           ├── FACTS.md                           # 可读性事实清单（切片总表、依赖图、事件链、外网直连、盲区）
 │           └── facts.json                         # 结构化机器事实（供 build.py 校验与下游读取）
@@ -96,9 +97,10 @@ eval-platform/
 │   ├── requirements.txt                           # 后端依赖清单 (fastapi, uvicorn, sqlalchemy, httpx 等)
 │   ├── tests/                                     # [API 与引擎回归测试集]
 │   │   ├── __init__.py                            # 测试包初始化
-│   │   ├── test_agent_cli.py                      # Agent CLI 全量 59 命令、可配置策略裁剪与隔离端到端回归测试
+│   │   ├── test_agent_cli.py                      # Agent CLI 全量 61 命令、可配置策略裁剪与隔离端到端回归测试
 │   │   ├── test_api.py                            # API 全链路与矩阵评测/任务删除/API异常隔离/飞轮对弈回归测试
 │   │   ├── test_architecture.py                   # 架构守护断言测试(防胖路由/越级调引擎/聚合导入/外网直连/循环依赖)
+│   │   ├── test_dataset_rule_inspection.py        # 纯对话数据集批量规则质检打分与常规评测无标尺拦截回归测试
 │   │   ├── test_remediator_surgical.py            # 客服专属靶向微创修复与用户文本0篡改防御校验测试
 │   │   ├── test_cache_friendly_simulation.py      # 模拟对弈静态System前缀保缓存与两极化人设矩阵测试
 │   │   ├── test_topology.py                       # Mermaid有向图拓扑连通性与动力学规则测试
@@ -111,6 +113,7 @@ eval-platform/
 │   │   ├── test_dataset_filtered_export.py       # 评测集抽样与条件过滤导出(预览/下载/另存新评测集)回归测试
 │   │   ├── test_rule_prompt_debug.py              # 规则中心轨迹/FAQ/质检/修复Prompt模板调试组装与在线实测回归测试
 │   │   ├── test_prompt_center.py                  # 全平台提示词管理中心CRUD、引擎生效优先级与在线实测回归测试
+│   │   ├── test_openai_harmony_streaming.py       # OpenAIAdapter与HarmonyAdapter默认SSE流式保活与兼容降级测试
 │   │   └── test_vertex_adaptive_thinking.py       # Vertex模型思考协议自适应探测与MaaS持久化路由回归测试
 │   └── app/
 │       ├── main.py                                # FastAPI 服务入口 (挂载 /api/v1 路由, CORS, /health)

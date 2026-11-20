@@ -1,12 +1,21 @@
 %% title: 数据集中心纵向切片 (L2)
+%% link: api_flywheel -> L2-flywheel.mmd
+%% link: api_rules -> L2-rule_center.mmd
+%% link: api_models -> L2-model_hub.mmd
 flowchart TB
   dataset_center["数据集中心\nfrontend/src/pages/DatasetCenter.tsx"]
   api_datasets["数据集路由\nbackend/app/api/datasets.py"]
+  api_flywheel["飞轮API路由\nbackend/app/api/flywheel.py"]
+  api_rules["规则中心路由\nbackend/app/api/rules.py"]
+  api_models["模型管理路由\nbackend/app/api/models.py"]
   benchmark_sampler["抽样与账本引擎\nbackend/app/engine/benchmark_sampler.py:BenchmarkSamplingEngine"]
   sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\n表: DatasetRecord/BenchmarkRunLedger")]
   datasets_dir[("本地数据集目录\ndata/datasets")]
 
   dataset_center -->|"导入/预览/过滤导出/删除"| api_datasets
+  dataset_center -->|"发起规则质检/轮询报告"| api_flywheel
+  dataset_center -->|"读取规则列表"| api_rules
+  dataset_center -->|"读取裁判模型列表"| api_models
   api_datasets -->|"计算采样状态/条件过滤导出"| benchmark_sampler
   api_datasets -->|"读写DatasetRecord"| sqlite_db
   api_datasets -->|"读写JSONL数据集文件"| datasets_dir

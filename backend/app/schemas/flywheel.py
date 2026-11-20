@@ -144,3 +144,14 @@ class BatchFlywheelRunRequest(BaseModel):
     gold_output_path: Optional[str] = None
     discard_output_path: Optional[str] = None
 
+
+class DatasetInspectRequest(BaseModel):
+    """纯对话数据集批量规则质检打分请求（只检不修）"""
+    dataset_id: Optional[str] = Field(default=None, description="已登记数据集 ID（与 dataset_path 二选一）")
+    dataset_path: Optional[str] = Field(default=None, description="服务端数据集文件路径（与 dataset_id 二选一）")
+    rule_id: str = Field(..., description="质检依据的业务规则 ID")
+    judge_model_id: str = Field(..., description="质检裁判模型 ID")
+    workers: int = Field(default=4, ge=1, le=32, description="并发质检线程数")
+    limit: Optional[int] = Field(default=None, ge=1, description="可选仅质检前 N 条样本")
+    save_to_flywheel: bool = Field(default=False, description="是否将质检结果写入飞轮复核样本池")
+

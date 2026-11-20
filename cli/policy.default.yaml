@@ -10,7 +10,7 @@ defaults:
 
 profiles:
   full:
-    description: "全能力模式：开放全部 8 个命令组共 59 条命令，供本机 Coding Agent 完整调度。"
+    description: "全能力模式：开放全部 8 个命令组共 61 条命令，供本机 Coding Agent 完整调度。"
     enabled_groups:
       - system
       - model

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-全量命令目录契约 (57 条后端 API + 2 条本地能力治理命令 = 59 条)
+全量命令目录契约 (59 条后端 API + 2 条本地能力治理命令 = 61 条)
 """
 from __future__ import annotations
 
@@ -82,9 +82,11 @@ COMMAND_CATALOG: Tuple[CommandSpec, ...] = (
     CommandSpec("simulation.evaluate", "simulation", "evaluate", "run", "POST", "/api/v1/simulation/evaluate-dialogue", "对一段人工对话执行白盒质检与可选入库", supports_payload=True),
     CommandSpec("simulation.clear-all", "simulation", "clear-all", "destructive", "DELETE", "/api/v1/simulation/battles/all", "清空全部或指定规则下的历史对弈样本"),
 
-    # --- flywheel (16) ---
+    # --- flywheel (18) ---
     CommandSpec("flywheel.samples", "flywheel", "samples", "read", "GET", "/api/v1/flywheel/samples", "查询飞轮样本与质检修复状态"),
     CommandSpec("flywheel.batch", "flywheel", "batch", "run", "POST", "/api/v1/flywheel/batch", "提交存量语料批量飞轮治理异步任务", supports_payload=True, is_async_task=True),
+    CommandSpec("flywheel.inspect-dataset", "flywheel", "inspect-dataset", "run", "POST", "/api/v1/flywheel/inspect-dataset", "对纯对话数据集批量规则质检打分（只检不修，可选 --wait）", supports_payload=True, is_async_task=True),
+    CommandSpec("flywheel.inspect-report", "flywheel", "inspect-report", "read", "GET", "/api/v1/flywheel/inspect-tasks/{task_id}", "查看批量规则质检打分任务状态、汇总与明细报告"),
     CommandSpec("flywheel.judge", "flywheel", "judge", "run", "POST", "/api/v1/flywheel/samples/{sample_id}/judge", "对单个样本按指定规则重新白盒质检（只检不修）", supports_payload=True),
     CommandSpec("flywheel.batch-judge", "flywheel", "batch-judge", "run", "POST", "/api/v1/flywheel/samples/batch-judge", "批量按规则重新质检样本", supports_payload=True),
     CommandSpec("flywheel.remediate", "flywheel", "remediate", "run", "POST", "/api/v1/flywheel/samples/{sample_id}/remediate", "对单个样本触发靶向微创修复", supports_payload=True),

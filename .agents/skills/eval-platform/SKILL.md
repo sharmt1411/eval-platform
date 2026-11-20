@@ -1,11 +1,11 @@
 ---
-name: eval-platform-cli
+name: eval-platform
 description: 通过统一命令行工具 evalctl（或 python -m cli / python backend/cli.py）操纵通用大模型测试管理与数据飞轮平台：模型注册连通、规则SOP与Prompt调试实测、数据集导入过滤导出、常规评测对比与分歧分析、双Agent模拟对弈（含SSE流式）以及数据飞轮质检/微创修复/切题导出全闭环。
 ---
 
 # Eval Platform Agent CLI 技能指南 (`evalctl`)
 
-本指南面向本机 Coding Agent，采用**渐进式披露**方式按需探索并调用平台全部 8 大能力模块（59 条命令）。
+本指南面向本机 Coding Agent，采用**渐进式披露**方式按需探索并调用平台全部 8 大能力模块（61 条命令）。
 
 ## 一、快速入口、语法约束与路径语义
 
@@ -24,7 +24,7 @@ evalctl [全局参数] <group> <command> [子命令参数]
 ### 3. 跨项目调用的路径语义
 在外部业务仓库（如训练/微调项目目录）中运行 `evalctl` 时，请严格区分两类路径：
 - **客户端当前路径**（相对当前终端工作目录）：`dataset import --file`、`--payload`、`--out`、`--save-jsonl`、`--dialogue-file`、`--messages-file`、`--template-file`、`--assembled-prompt-file`。
-- **平台服务端路径**（相对平台仓库根目录或服务端绝对路径）：`benchmark run --dataset-path`、`flywheel batch --input-file-path`、`dataset import --source-file-path`。
+- **平台服务端路径**（相对平台仓库根目录或服务端绝对路径）：`benchmark run --dataset-path`、`flywheel batch --input-file-path`、`flywheel inspect-dataset --dataset-path`、`dataset import --source-file-path`。
 - **外部项目标准导入做法**：先用 `evalctl dataset import --dataset-id <id> --dataset-type benchmark --file <本地路径>` 导入，平台会自动落盘为 `data/datasets/<id>.jsonl` 并返回 `file_path`；随后再使用该平台路径运行 `benchmark run --dataset-path ...`。
 
 ---
@@ -45,7 +45,7 @@ evalctl [全局参数] <group> <command> [子命令参数]
    evalctl benchmark side-by-side --help
    ```
 3. **Profile 边界速览**：
-   - 内置 5 套 Profile：`full`（默认全开，59 条）、`safe`（禁用删除与重置）、`readonly`（仅只读查询与组装预览）、`eval-loop`（评测调优闭环，仅放行 31 条命令）、`flywheel-loop`（对弈修复闭环）。
+   - 内置 5 套 Profile：`full`（默认全开，61 条）、`safe`（禁用删除与重置）、`readonly`（仅只读查询与组装预览）、`eval-loop`（评测调优闭环，仅放行 31 条命令）、`flywheel-loop`（对弈修复闭环）。
    - ⚠️ **Profile 常见踩坑**：`eval-loop` **不包含** `model.create` / `model.update`（及 `simulation` / `flywheel`）。若需要注册模型或修改远程推理地址，必须使用 `full` 或 `safe`，否则会报 `POLICY_DENIED`（退出码 `3`）。
    - 可通过全局 `--profile <name>` 切换；开启破坏性操作二次确认时补加全局 `--yes`。
 
@@ -75,8 +75,8 @@ evalctl dataset import --dataset-id my_eval --dataset-type benchmark --file ./ev
 evalctl --format table dataset list
 
 # 2. 发起多模型横向对比评测并等待完成
-#    注：单卡/内网穿透串行服务（如 GPU_THREAD_LOCK）务必设 --workers 1 并调大 --wait-timeout；
-#    全局 --timeout 0 防读取超时；flywheel_gold 纯对话集无 rubric/reference，传 --judge-model-id 不会触发主观打分
+#    注：常规评测仅针对具备 reference/rubric/regex_constraints 的考题集；纯对话集会被默认拦截防假阳性 100% PASS
+#    注：单卡/内网穿透串行服务（如 GPU_THREAD_LOCK）务必设 --workers 1 并调大 --wait-timeout；全局 --timeout 0 防读取超时
 evalctl --timeout 0 benchmark run \
   --dataset-path data/datasets/my_eval.jsonl \
   --model-id qwen3-sft --model-id mock-a \
@@ -126,9 +126,20 @@ evalctl flywheel slices-get <sample_id>
 evalctl flywheel export-gold --rule-id demo_after_sales --version-tag v1.1
 evalctl flywheel export-benchmark <sample_id> --dataset-id fw_eval_v1 --name "飞轮回归评测集"
 
-# 5. 批量飞轮治理（--input-file-path 为服务端路径；单卡/隧道服务加 --workers 1 与较大 --wait-timeout）
+# 5. 批量飞轮治理（初检->AI修复->二检->gold/discarded；--input-file-path 为服务端路径）
 evalctl --timeout 0 flywheel batch --rule-id demo_after_sales --input-file-path data/runs/raw.jsonl \
   --judge-model-id vertex-gemini-flash-judge --workers 1 --wait --wait-timeout 3600
+
+# 6. 纯对话数据集批量规则质检打分（只检不修，不触发 AI 修复，产出均分/通过率/高频扣分项看板）
+#    适用场景：flywheel_gold / SFT 多轮对话语料按 SOP + 红线 + FAQ 规则批量打分验真
+evalctl --timeout 0 flywheel inspect-dataset \
+  --dataset-id <dataset_id> \
+  --rule-id <rule_id> \
+  --judge-model-id <judge_model_id> \
+  --workers 4 --wait --brief
+#    按任务 ID 查看未通过明细或落盘完整报告：
+evalctl flywheel inspect-report <task_id> --only-fail --brief
+evalctl --out data/runs/inspect_report.json flywheel inspect-report <task_id>
 ```
 
 ### 闭环 4：数据集智能抽样试算与条件过滤导出
@@ -148,17 +159,19 @@ evalctl dataset export demo_benchmark \
 ## 四、防爆上下文、超时/并发参数与退出码
 
 ### 1. 大载荷保护与紧凑格式（防爆上下文）
-- **必用全局 `--out <path>` 或 `--brief` 的超大载荷命令**：
-  - `simulation recent`（全量拉取 `--limit 3` 可达 ~292 KB；列表检索优先加 `--brief`，需看完整对话时配 `--out` 并收紧 `--limit`）
-  - `simulation stream`（汇总输出约 ~219 KB，务必配 `--out`）
-  - `benchmark tasks`（全量拉取 `--limit 10` 约 ~34 KB；列表检索优先加 `--brief`，需看完整配置时配 `--limit` 与 `--out`）
-  - `benchmark side-by-side`、`flywheel samples`、`rule get`（优先搭配 `--summary-only` / `--brief` 或 `--out`）
+- **必用 `--brief` 或全局 `--out <path>` 的超大载荷命令**：
+  - `simulation recent --brief`（不加 `--brief` 时 `--limit 3` 可达 ~292 KB；列表检索务必加 `--brief`，需看完整对话时配全局 `--out` 并收紧 `--limit`）
+  - `simulation stream`（汇总输出约 ~219 KB，务必配全局 `--out`）
+  - `benchmark tasks --brief`（不加 `--brief` 时 `--limit 10` 约 ~34 KB；列表检索务必加 `--brief`，需看完整配置时配 `--limit` 与全局 `--out`）
+  - `benchmark side-by-side`、`flywheel samples`、`flywheel inspect-report`、`flywheel inspect-dataset --wait`、`rule get`（优先搭配 `--summary-only` / `--brief` 或全局 `--out`）
 - **紧凑视图推荐**：在只读列表命令（如 `model list --brief`、`benchmark tasks --brief`、`simulation recent --brief`、`flywheel samples --brief`、`dataset list`、`system capabilities`、`prompt list --summary`）上使用全局 `--format table`（或 `--format compact`），大幅节省上下文 Token。
 
 ### 2. 慢推理 / 隧道防超时与裁判边界
-- **HTTP 读取超时 `--timeout`**：默认 `600` 秒；对 `simulation stream`、`flywheel judge/remediate` 或慢推理隧道请求，传入全局 `--timeout 0`（不限）或 `--timeout 300`/`1200`。
+- **HTTP 读取超时 `--timeout`**：CLI 默认 `600` 秒；对 `simulation stream`、`flywheel judge/remediate` 或慢推理隧道请求，传入全局 `--timeout 0`（不限）或 `--timeout 300`/`1200`（注：后端 `OpenAIAdapter` / `HarmonyAdapter` 已默认开启 `stream=True` SSE 流式保活与 `300s` 分片读超时，支持长生成穿越 Cloudflare 等隧道网关）。
 - **异步等待 `--wait-timeout` 与串行并发 `--workers 1`**：`benchmark run --wait` 和 `flywheel batch --wait` 默认 `--wait-timeout 600` 秒，超过 30 题容易超时，应按需调大（如 `--wait-timeout 3600`）；面对单卡或带 `GPU_THREAD_LOCK` 的内网穿透串行服务，必须配合 `--workers 1`。
-- **数据集类型与裁判模式边界**：`benchmark run --judge-model-id` 仅在样本包含 `reference` 或非空 `rubric` 时触发 LLM 主观打分；`flywheel_gold` 类型（纯对话 `messages`，无 `rubric`/`reference`）即使传入 `--judge-model-id` 也**不会**触发主观裁判。
+- **数据集类型与评测/质检分工边界（必看）**：
+  - **常规对比评测 (`benchmark run`)**：仅适用于**具备 `reference`、`rubric` 或 `regex_constraints` 的考题集**；对无答案标准的纯对话集（如 `flywheel_gold` 多轮对话语料）默认会拦截返回 HTTP 400（防跳过校验制造 100% 假阳性通过）。仅在做纯连通性/吞吐测速时才显式传 `--allow-unlabeled`。
+  - **规则质检打分 (`flywheel inspect-dataset`)**：专用于**纯对话数据集（只检不修）**，按指定 `--rule-id` 复用 SOP 状态机 + 红线 ∥ FAQ 双轨逐条打分，返回均分、通过率、拓扑连通率、高频扣分项与逐样本诊断；如需同步写入飞轮样本池复核，追加 `--save-to-flywheel`。
 
 ### 3. 协议约定与退出码
 - **输出流分离**：成功时 `stdout` 仅输出合法 JSON（或 `--format table`）；轮询进度、SSE 逐轮日志与错误 JSON 均输出到 `stderr`。

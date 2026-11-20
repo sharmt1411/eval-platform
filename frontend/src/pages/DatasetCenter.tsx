@@ -21,6 +21,9 @@ import {
   Alert,
   Tabs,
   Switch,
+  Progress,
+  Statistic,
+  Divider,
 } from 'antd';
 import {
   DatabaseOutlined,
@@ -36,9 +39,13 @@ import {
   CheckCircleOutlined,
   RocketOutlined,
   FilterOutlined,
+  AuditOutlined,
+  SafetyCertificateOutlined,
+  WarningOutlined,
+  CloseCircleOutlined,
 } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import { datasetsApi } from '../api';
+import { datasetsApi, rulesApi, modelsApi, flywheelApi } from '../api';
 import type {
   DatasetRecord,
   BenchmarkSample,
@@ -46,6 +53,10 @@ import type {
   BenchmarkDatasetFilterOptionsResponse,
   BenchmarkExportPreviewResponse,
   BenchmarkExportFilterRequest,
+  RuleSummary,
+  RegisteredModel,
+  DatasetInspectTaskReport,
+  DatasetInspectSampleResult,
 } from '../types';
 
 const { Text } = Typography;
@@ -83,6 +94,20 @@ export const DatasetCenter: React.FC = () => {
   const [exportPreviewLoading, setExportPreviewLoading] = useState<boolean>(false);
   const [exportSubmitting, setExportSubmitting] = useState<boolean>(false);
   const [filterExportForm] = Form.useForm();
+
+  // 纯对话语料规则质检打分状态
+  const [inspectModalVisible, setInspectModalVisible] = useState<boolean>(false);
+  const [inspectingDataset, setInspectingDataset] = useState<DatasetRecord | null>(null);
+  const [inspectRules, setInspectRules] = useState<RuleSummary[]>([]);
+  const [inspectModels, setInspectModels] = useState<RegisteredModel[]>([]);
+  const [inspectDepsLoading, setInspectDepsLoading] = useState<boolean>(false);
+  const [inspectSubmitting, setInspectSubmitting] = useState<boolean>(false);
+  const [inspectForm] = Form.useForm();
+
+  const [inspectDrawerVisible, setInspectDrawerVisible] = useState<boolean>(false);
+  const [inspectTaskId, setInspectTaskId] = useState<string>('');
+  const [inspectReport, setInspectReport] = useState<DatasetInspectTaskReport | null>(null);
+  const [inspectVerdictFilter, setInspectVerdictFilter] = useState<'ALL' | 'FAIL_ONLY' | 'PASS_ONLY'>('ALL');
 
   const watchedExportTarget = Form.useWatch('export_target', filterExportForm) || 'download';
   const watchedExportScope = Form.useWatch('export_scope', filterExportForm) || 'sampled';
@@ -155,6 +180,107 @@ export const DatasetCenter: React.FC = () => {
     } catch (err: any) {
       message.error(`删除失败: ${err.response?.data?.detail || err.message}`);
     }
+  };
+
+  const openInspectModal = async (dataset: DatasetRecord) => {
+    setInspectingDataset(dataset);
+    inspectForm.resetFields();
+    inspectForm.setFieldsValue({
+      workers: 4,
+      save_to_flywheel: false,
+    });
+    setInspectModalVisible(true);
+    setInspectDepsLoading(true);
+    try {
+      const [ruleList, modelList] = await Promise.all([rulesApi.list(), modelsApi.list()]);
+      setInspectRules(ruleList);
+      setInspectModels(modelList);
+      const defaults: Record<string, any> = {};
+      if (ruleList.length > 0) {
+        const matchedRule = ruleList.find((r) => dataset.id.includes(r.rule_id));
+        defaults.rule_id = matchedRule ? matchedRule.rule_id : ruleList[0].rule_id;
+      }
+      if (modelList.length > 0) {
+        const judgeCandidate = modelList.find((m) => m.id.includes('judge') || m.name.includes('裁判'));
+        defaults.judge_model_id = judgeCandidate ? judgeCandidate.id : modelList[0].id;
+      }
+      inspectForm.setFieldsValue(defaults);
+    } catch (err: any) {
+      message.error(`加载规则或模型列表失败: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setInspectDepsLoading(false);
+    }
+  };
+
+  const handleInspectSubmit = async () => {
+    if (!inspectingDataset) return;
+    try {
+      const values = await inspectForm.validateFields();
+      setInspectSubmitting(true);
+      const res = await flywheelApi.inspectDataset({
+        dataset_id: inspectingDataset.id,
+        rule_id: values.rule_id,
+        judge_model_id: values.judge_model_id,
+        workers: values.workers ?? 4,
+        limit: values.limit || undefined,
+        save_to_flywheel: !!values.save_to_flywheel,
+      });
+      message.success(res.message || `规则质检任务已提交 (${res.task_id})`);
+      setInspectModalVisible(false);
+      setInspectTaskId(res.task_id);
+      setInspectVerdictFilter('ALL');
+      setInspectReport({
+        id: res.task_id,
+        task_id: res.task_id,
+        task_type: 'flywheel_inspect',
+        status: 'PENDING',
+        progress: 0,
+        dataset_id: inspectingDataset.id,
+        rule_id: values.rule_id,
+        judge_model_id: values.judge_model_id,
+        samples: [],
+      });
+      setInspectDrawerVisible(true);
+      try {
+        const latest = await flywheelApi.getInspectTask(res.task_id);
+        setInspectReport(latest);
+      } catch {
+        // 等待轮询刷新
+      }
+    } catch (err: any) {
+      if (err.errorFields) return;
+      message.error(`提交规则质检失败: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setInspectSubmitting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!inspectDrawerVisible || !inspectTaskId) return;
+    const isRunning = !inspectReport || inspectReport.status === 'PENDING' || inspectReport.status === 'RUNNING';
+    if (!isRunning) return;
+    const timer = setInterval(async () => {
+      try {
+        const rep = await flywheelApi.getInspectTask(inspectTaskId);
+        setInspectReport(rep);
+      } catch (err) {
+        console.error('轮询规则质检任务失败', err);
+      }
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [inspectDrawerVisible, inspectTaskId, inspectReport?.status]);
+
+  const handleDownloadInspectReport = () => {
+    if (!inspectReport) return;
+    const blob = new Blob([JSON.stringify(inspectReport, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `inspect_${inspectReport.task_id}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const buildExportFilterPayload = useCallback(
@@ -493,9 +619,18 @@ export const DatasetCenter: React.FC = () => {
     },
     {
       title: '操作',
-      width: 260,
+      width: 390,
       render: (_: any, record: DatasetRecord) => (
         <Space size="small">
+          <Button
+            size="small"
+            type="primary"
+            ghost
+            icon={<AuditOutlined />}
+            onClick={() => openInspectModal(record)}
+          >
+            规则质检打分
+          </Button>
           <Button
             size="small"
             icon={<EyeOutlined />}
@@ -589,8 +724,10 @@ export const DatasetCenter: React.FC = () => {
               ),
               children: (
                 <div>
-                  <div className="mb-3 text-xs text-slate-500 bg-amber-50/60 p-2.5 rounded border border-amber-100 flex items-center justify-between">
-                    <span>💡 训练语料为通过数据飞轮质检、AI 微调重塑并经人工复核通过的完整多轮对话 (messages)，用于 LoRA / 全参微调。</span>
+                  <div className="mb-3 text-xs text-slate-500 bg-amber-50/60 p-2.5 rounded border border-amber-100 flex items-center justify-between flex-wrap gap-2">
+                    <span>
+                      💡 训练语料为完整多轮对话 (<code className="font-mono">messages</code>)，无标准答案与正则标尺，严禁直接跑常规对比评测（会造成假阳性 100% PASS）；请点击右侧「🔍 规则质检打分」按 SOP 流程图、节点红线与 FAQ 知识库执行只检不修的批量评分。
+                    </span>
                   </div>
                   <Table
                     rowKey="id"
@@ -1161,6 +1298,336 @@ export const DatasetCenter: React.FC = () => {
                 </Card>
               );
             })}
+          </div>
+        )}
+      </Drawer>
+
+      {/* 纯对话数据集规则质检打分配置弹窗 */}
+      <Modal
+        title={
+          <div className="flex items-center gap-2 text-slate-800">
+            <AuditOutlined className="text-blue-600" />
+            <span>规则质检打分（只检不修）: {inspectingDataset?.name}</span>
+          </div>
+        }
+        open={inspectModalVisible}
+        onCancel={() => setInspectModalVisible(false)}
+        onOk={handleInspectSubmit}
+        confirmLoading={inspectSubmitting}
+        okText="开始批量质检打分"
+        cancelText="取消"
+        width={600}
+      >
+        <Spin spinning={inspectDepsLoading}>
+          <Alert
+            type="info"
+            showIcon
+            className="mb-3 text-xs"
+            message="按业务规则 SOP + 红线 ∥ FAQ 双轨逐条打分，不会触发 AI 修复或篡改原对话"
+          />
+          <Form form={inspectForm} layout="vertical" className="space-y-2">
+            <Form.Item
+              name="rule_id"
+              label={<span className="text-xs font-semibold">质检规则标准 (Rule SOP)</span>}
+              rules={[{ required: true, message: '请选择质检规则' }]}
+            >
+              <Select
+                showSearch
+                popupMatchSelectWidth={false}
+                placeholder="选择质检依据的业务规则"
+                options={inspectRules.map((r) => ({
+                  value: r.rule_id,
+                  label: `${r.project_name} (${r.rule_id})`,
+                }))}
+              />
+            </Form.Item>
+
+            <Form.Item
+              name="judge_model_id"
+              label={<span className="text-xs font-semibold">质检裁判模型 (Judge Model)</span>}
+              rules={[{ required: true, message: '请选择裁判模型' }]}
+            >
+              <Select
+                showSearch
+                popupMatchSelectWidth={false}
+                placeholder="选择执行白盒质检的裁判模型"
+                options={inspectModels.map((m) => ({
+                  value: m.id,
+                  label: `${m.name} (${m.id} · ${m.provider_type})`,
+                }))}
+              />
+            </Form.Item>
+
+            <div className="grid grid-cols-2 gap-3">
+              <Form.Item
+                name="workers"
+                label={<span className="text-xs font-semibold">并发质检线程数</span>}
+              >
+                <InputNumber min={1} max={16} className="w-full" />
+              </Form.Item>
+
+              <Form.Item
+                name="limit"
+                label={<span className="text-xs font-semibold">抽检前 N 条（留空全量）</span>}
+              >
+                <InputNumber min={1} max={5000} placeholder="全量样本" className="w-full" />
+              </Form.Item>
+            </div>
+
+            <Form.Item
+              name="save_to_flywheel"
+              label={<span className="text-xs font-semibold">同步写入数据飞轮复核样本池</span>}
+              valuePropName="checked"
+              extra={<span className="text-3xs text-slate-500">开启后可将本次质检结果留痕至「数据飞轮工作台」供人工复核或后续定向修复</span>}
+            >
+              <Switch checkedChildren="同步入池复核" unCheckedChildren="仅出打分报告" />
+            </Form.Item>
+          </Form>
+        </Spin>
+      </Modal>
+
+      {/* 规则质检打分结果抽屉 */}
+      <Drawer
+        title={
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2">
+              <SafetyCertificateOutlined className="text-blue-600" />
+              <span>规则质检打分报告: {inspectReport?.dataset_id || inspectTaskId}</span>
+              {inspectReport && (
+                <Tag
+                  color={
+                    inspectReport.status === 'COMPLETED'
+                      ? 'green'
+                      : inspectReport.status === 'FAILED'
+                      ? 'red'
+                      : 'processing'
+                  }
+                >
+                  {inspectReport.status}
+                </Tag>
+              )}
+            </div>
+            {inspectReport && (
+              <Button size="small" icon={<DownloadOutlined />} onClick={handleDownloadInspectReport}>
+                下载报告 JSON
+              </Button>
+            )}
+          </div>
+        }
+        placement="right"
+        width={880}
+        open={inspectDrawerVisible}
+        onClose={() => setInspectDrawerVisible(false)}
+      >
+        {inspectReport && (
+          <div className="space-y-4">
+            {/* 任务进度与基础元信息 */}
+            <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-2">
+              <div className="flex items-center justify-between text-xs text-slate-600 flex-wrap gap-2">
+                <span>
+                  规则: <Tag color="blue">{inspectReport.rule_id}</Tag>
+                  裁判: <Tag color="purple">{inspectReport.judge_model_id}</Tag>
+                  {inspectReport.pass_score_threshold != null && (
+                    <Tag color="cyan">及格线: {inspectReport.pass_score_threshold} 分</Tag>
+                  )}
+                </span>
+                <span className="font-mono text-3xs text-slate-400">Task: {inspectReport.task_id}</span>
+              </div>
+              <Progress
+                percent={Math.round((inspectReport.progress || 0) * 100)}
+                status={
+                  inspectReport.status === 'FAILED'
+                    ? 'exception'
+                    : inspectReport.status === 'COMPLETED'
+                    ? 'success'
+                    : 'active'
+                }
+                size="small"
+              />
+              {inspectReport.status === 'FAILED' && inspectReport.error_message && (
+                <Alert type="error" showIcon message={`质检任务失败: ${inspectReport.error_message}`} />
+              )}
+              {inspectReport.save_to_flywheel && (
+                <div className="text-3xs text-emerald-700 flex items-center gap-2 flex-wrap">
+                  <span>已同步写入飞轮样本池: {inspectReport.saved_sample_count ?? 0} 条</span>
+                  <Button
+                    type="link"
+                    size="small"
+                    className="p-0 h-auto text-3xs"
+                    onClick={() => {
+                      setInspectDrawerVisible(false);
+                      navigate(`/flywheel?task_id=${encodeURIComponent(inspectReport.task_id)}`);
+                    }}
+                  >
+                    前往「数据飞轮工作台」按 task_id={inspectReport.task_id} 复核 →
+                  </Button>
+                </div>
+              )}
+            </div>
+
+            {/* 汇总看板 */}
+            {inspectReport.summary && (
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+                  <Card size="small" className="bg-blue-50/50 border-blue-100">
+                    <Statistic
+                      title={<span className="text-3xs text-slate-500">已完成 / 总数</span>}
+                      value={`${inspectReport.summary.completed_samples} / ${inspectReport.summary.total_samples}`}
+                      valueStyle={{ fontSize: 16, fontWeight: 700 }}
+                    />
+                  </Card>
+                  <Card size="small" className="bg-emerald-50/50 border-emerald-100">
+                    <Statistic
+                      title={<span className="text-3xs text-slate-500">规则通过率</span>}
+                      value={Number((inspectReport.summary.pass_rate * 100).toFixed(1))}
+                      suffix="%"
+                      valueStyle={{ fontSize: 16, fontWeight: 700, color: '#059669' }}
+                    />
+                  </Card>
+                  <Card size="small" className="bg-indigo-50/50 border-indigo-100">
+                    <Statistic
+                      title={<span className="text-3xs text-slate-500">平均得分</span>}
+                      value={inspectReport.summary.avg_score}
+                      suffix={
+                        inspectReport.summary.min_score != null
+                          ? ` (${inspectReport.summary.min_score}~${inspectReport.summary.max_score})`
+                          : ''
+                      }
+                      valueStyle={{ fontSize: 16, fontWeight: 700, color: '#4f46e5' }}
+                    />
+                  </Card>
+                  <Card size="small" className="bg-cyan-50/50 border-cyan-100">
+                    <Statistic
+                      title={<span className="text-3xs text-slate-500">拓扑连通率</span>}
+                      value={Number((inspectReport.summary.topology_pass_rate * 100).toFixed(1))}
+                      suffix="%"
+                      valueStyle={{ fontSize: 16, fontWeight: 700, color: '#0891b2' }}
+                    />
+                  </Card>
+                  <Card size="small" className="bg-slate-50 border-slate-200">
+                    <div className="text-3xs text-slate-500 mb-1">判决分布</div>
+                    <div className="flex items-center gap-1 flex-wrap text-3xs font-mono">
+                      <Tag color="green" className="m-0">PASS {inspectReport.summary.pass_count}</Tag>
+                      <Tag color="red" className="m-0">FAIL {inspectReport.summary.fail_count}</Tag>
+                      {inspectReport.summary.error_count > 0 && (
+                        <Tag color="orange" className="m-0">ERR {inspectReport.summary.error_count}</Tag>
+                      )}
+                    </div>
+                  </Card>
+                </div>
+
+                {/* 高频扣分项排行 */}
+                {inspectReport.summary.top_deductions?.length > 0 && (
+                  <Card size="small" title={<span className="text-xs font-semibold">🔥 高频扣分项排行 (Top Deductions)</span>}>
+                    <div className="flex flex-wrap gap-2">
+                      {inspectReport.summary.top_deductions.map((d, idx) => (
+                        <Tag key={idx} color="volcano" className="py-0.5 px-2 text-xs">
+                          {d.item} · 命中 {d.count} 次 (累计 -{d.total_points} 分)
+                        </Tag>
+                      ))}
+                    </div>
+                  </Card>
+                )}
+              </div>
+            )}
+
+            <Divider className="my-2" />
+
+            {/* 逐样本打分明细筛选 */}
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <span className="text-xs font-semibold text-slate-700">
+                逐样本打分与扣分明细 ({inspectReport.samples?.length || 0} 条)
+              </span>
+              <Radio.Group
+                size="small"
+                value={inspectVerdictFilter}
+                onChange={(e) => setInspectVerdictFilter(e.target.value)}
+              >
+                <Radio.Button value="ALL">全部</Radio.Button>
+                <Radio.Button value="FAIL_ONLY">仅未通过 (FAIL/ERROR)</Radio.Button>
+                <Radio.Button value="PASS_ONLY">仅通过 (PASS)</Radio.Button>
+              </Radio.Group>
+            </div>
+
+            <div className="space-y-3">
+              {(inspectReport.samples || [])
+                .filter((item: DatasetInspectSampleResult) => {
+                  if (inspectVerdictFilter === 'FAIL_ONLY') return item.verdict !== 'PASS';
+                  if (inspectVerdictFilter === 'PASS_ONLY') return item.verdict === 'PASS';
+                  return true;
+                })
+                .map((item: DatasetInspectSampleResult, idx: number) => (
+                  <Card
+                    key={`${item.sample_id}_${idx}`}
+                    size="small"
+                    className="border-slate-200 shadow-2xs"
+                    title={
+                      <div className="flex items-center justify-between flex-wrap gap-1.5 text-xs">
+                        <span className="font-mono font-semibold text-slate-800">{item.sample_id}</span>
+                        <Space size={4} wrap>
+                          <Tag color="blue">{item.scenario_id}</Tag>
+                          <Tag color="default">{item.turn_count} 条非system消息</Tag>
+                          <Tag color={item.topology_valid ? 'cyan' : 'volcano'}>
+                            {item.topology_valid ? '拓扑连通' : '拓扑异常'}
+                          </Tag>
+                          <Tag
+                            color={
+                              item.verdict === 'PASS' ? 'green' : item.verdict === 'ERROR' ? 'orange' : 'red'
+                            }
+                            className="font-bold"
+                          >
+                            {item.verdict} {item.score !== null && item.score !== undefined ? `(${item.score}分)` : ''}
+                          </Tag>
+                        </Space>
+                      </div>
+                    }
+                  >
+                    <div className="space-y-2 text-xs">
+                      {item.node_trajectory && item.node_trajectory.length > 0 && (
+                        <div>
+                          <span className="font-semibold text-slate-600">节点轨迹: </span>
+                          <span className="font-mono text-slate-700">{item.node_trajectory.join(' → ')}</span>
+                        </div>
+                      )}
+                      {item.topology_error && (
+                        <div className="text-amber-700 bg-amber-50 p-2 rounded border border-amber-200 flex items-start gap-1.5">
+                          <WarningOutlined className="mt-0.5" />
+                          <span>拓扑诊断: {item.topology_error}</span>
+                        </div>
+                      )}
+                      {item.deductions && item.deductions.length > 0 && (
+                        <div className="space-y-1">
+                          <div className="font-semibold text-rose-700 flex items-center gap-1">
+                            <CloseCircleOutlined /> 扣分项明细:
+                          </div>
+                          {item.deductions.map((ded, dIdx) => (
+                            <div key={dIdx} className="p-2 bg-rose-50/60 rounded border border-rose-100 text-slate-700">
+                              <Tag color="red" className="font-mono">
+                                {ded.item || '扣分项'} -{ded.points ?? 0}分
+                              </Tag>
+                              {ded.turn != null && <Tag color="default">#{ded.turn}轮</Tag>}
+                              <span>{ded.reason}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {(!item.deductions || item.deductions.length === 0) &&
+                        item.detected_defects &&
+                        item.detected_defects.length > 0 && (
+                          <div className="p-2 bg-amber-50/70 rounded border border-amber-100 text-slate-700">
+                            {item.detected_defects.join('；')}
+                          </div>
+                        )}
+                      {item.expert_comments && (
+                        <div className="text-slate-600 bg-slate-50 p-2 rounded border border-slate-200">
+                          <span className="font-semibold text-slate-700">裁判点评: </span>
+                          {item.expert_comments}
+                        </div>
+                      )}
+                    </div>
+                  </Card>
+                ))}
+            </div>
           </div>
         )}
       </Drawer>

@@ -40,6 +40,8 @@ import type {
   PromptModuleItem,
   PromptStaticPreviewRequest,
   PromptStaticPreviewResponse,
+  DatasetInspectRequest,
+  DatasetInspectTaskReport,
 } from '../types';
 
 const api = axios.create({
@@ -483,6 +485,19 @@ export const flywheelApi = {
       file_path: string;
       sample_count: number;
     }>('/flywheel/batch-export-benchmark', data);
+    return res.data;
+  },
+  inspectDataset: async (data: DatasetInspectRequest) => {
+    const res = await api.post<{
+      message: string;
+      task_id: string;
+      dataset_id?: string | null;
+      total_samples: number;
+    }>('/flywheel/inspect-dataset', data);
+    return res.data;
+  },
+  getInspectTask: async (taskId: string) => {
+    const res = await api.get<DatasetInspectTaskReport>(`/flywheel/inspect-tasks/${taskId}`);
     return res.data;
   },
 };

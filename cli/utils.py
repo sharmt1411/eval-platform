@@ -217,13 +217,15 @@ def wait_for_task(
     wait_timeout: float = 600.0,
     label: str = "task",
     fail_code: str = "TASK_FAILED",
+    status_endpoint_template: str = "/api/v1/benchmarks/tasks/{task_id}",
 ) -> Dict[str, Any]:
     """统一轮询后台异步任务状态；任务失败时先按需落盘再抛出非零错误。"""
     deadline = time.monotonic() + wait_timeout
     last_progress = -1.0
     task_seg = quote_path_segment(task_id)
+    status_path = status_endpoint_template.format(task_id=task_seg)
     while True:
-        status_data = client.request_json("GET", f"/api/v1/benchmarks/tasks/{task_seg}")
+        status_data = client.request_json("GET", status_path)
         st = status_data.get("status")
         prog = float(status_data.get("progress") or 0.0)
         if prog != last_progress:

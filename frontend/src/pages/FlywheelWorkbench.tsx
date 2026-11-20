@@ -63,7 +63,7 @@ const FLYWHEEL_LAST_JUDGE_MODEL_KEY = 'eval_platform_flywheel_last_judge_model_i
 const FLYWHEEL_LAST_REMEDIATE_MODEL_KEY = 'eval_platform_flywheel_last_remediate_model_id';
 
 export const FlywheelWorkbench: React.FC = () => {
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [samples, setSamples] = useState<FlywheelSampleRecord[]>([]);
   const [rules, setRules] = useState<RuleSummary[]>([]);
   const [models, setModels] = useState<RegisteredModel[]>([]);
@@ -71,7 +71,11 @@ export const FlywheelWorkbench: React.FC = () => {
 
   // 筛选状态
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
-  const [selectedRuleFilter, setSelectedRuleFilter] = useState<string>('ALL');
+  const [selectedRuleFilter, setSelectedRuleFilter] = useState<string>(
+    () => searchParams.get('rule_id') || 'ALL'
+  );
+  const [taskIdInput, setTaskIdInput] = useState<string>(() => searchParams.get('task_id') || '');
+  const [taskIdFilter, setTaskIdFilter] = useState<string>(() => searchParams.get('task_id') || '');
 
   // 多选批量管理状态
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
@@ -238,6 +242,7 @@ export const FlywheelWorkbench: React.FC = () => {
         flywheelApi.listSamples({
           status: statusFilter === 'ALL' ? undefined : statusFilter,
           rule_id: selectedRuleFilter === 'ALL' ? undefined : selectedRuleFilter,
+          task_id: taskIdFilter.trim() || undefined,
           limit: 300,
         }),
       ]);
@@ -251,18 +256,42 @@ export const FlywheelWorkbench: React.FC = () => {
     }
   };
 
+  const applyTaskIdFilter = (val: string) => {
+    const trimmed = val.trim();
+    setTaskIdInput(trimmed);
+    setTaskIdFilter(trimmed);
+    if (searchParams.has('task_id')) {
+      const next = new URLSearchParams(searchParams);
+      if (trimmed) {
+        next.set('task_id', trimmed);
+      } else {
+        next.delete('task_id');
+      }
+      setSearchParams(next, { replace: true });
+    }
+  };
+
   useEffect(() => {
     setSelectedRowKeys([]);
     loadData();
-  }, [statusFilter, selectedRuleFilter]);
+  }, [statusFilter, selectedRuleFilter, taskIdFilter]);
 
-  // 支持从其他页面携带 rule_id / sample_id 路由跳转并自动打开抽屉
+  // 支持从其他页面携带 rule_id / task_id 路由跳转
   useEffect(() => {
     const ruleParam = searchParams.get('rule_id');
-    const sampleParam = searchParams.get('sample_id');
+    const taskParam = searchParams.get('task_id');
     if (ruleParam && ruleParam !== selectedRuleFilter) {
       setSelectedRuleFilter(ruleParam);
     }
+    if (taskParam !== null && taskParam !== taskIdFilter) {
+      setTaskIdInput(taskParam);
+      setTaskIdFilter(taskParam);
+    }
+  }, [searchParams]);
+
+  // 携带 sample_id 跳转时在样本载入后自动打开抽屉
+  useEffect(() => {
+    const sampleParam = searchParams.get('sample_id');
     if (sampleParam && samples.length > 0) {
       const target = samples.find((s) => s.id === sampleParam);
       if (target) {
@@ -871,6 +900,22 @@ export const FlywheelWorkbench: React.FC = () => {
               { value: 'ALL', label: '全部场景规则' },
               ...rules.map((r) => ({ value: r.rule_id, label: r.project_name })),
             ]}
+          />
+
+          <Input.Search
+            size="small"
+            allowClear
+            placeholder="按任务 ID 过滤 (如 insp_...)"
+            className="w-52"
+            value={taskIdInput}
+            onChange={(e) => {
+              const val = e.target.value;
+              setTaskIdInput(val);
+              if (!val.trim() && taskIdFilter) {
+                applyTaskIdFilter('');
+              }
+            }}
+            onSearch={(val) => applyTaskIdFilter(val)}
           />
 
           <Button size="small" icon={<ReloadOutlined />} onClick={() => loadData()}>

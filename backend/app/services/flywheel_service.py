@@ -14,7 +14,7 @@ import json
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import List, Dict, Any, Optional, Set, Tuple, Callable
 from backend.app.schemas.chat import ChatMessage, ModelConfig
 from backend.app.schemas.rule import UniversalRuleSchema, PersonaDefinition
 from backend.app.schemas.flywheel import (
@@ -64,25 +64,13 @@ class FlywheelPipelineService:
         )
 
     @staticmethod
-    def check_remediable_eval(
-        eval_report: Optional[InspectionReport],
-    ) -> Tuple[bool, str]:
-        """
-        校验质检报告是否具备可修复的实质异常:
-        1. 尚未执行质检（None）-> 不可直接修复；
-        2. 质检自身异常、思考截断（main_judge 正文为空/error）或 JSON 解析失败 -> 不可修复；
-        3. 无扣分项 (deductions) 且剔除仅供参考的【拓扑检测元数据】后无实质缺陷 -> 提示没有异常可以修复。
-        """
-        if eval_report is None:
-            return False, "当前样本尚未执行质检，暂无异常诊断可修复，请先质检或开启「修复前重新执行质检」。"
-
+    def _is_judge_error_report(eval_report: InspectionReport) -> bool:
+        """检测质检报告是否为裁判模型调用异常、思考截断或 JSON 解析失败产生的兜底结果。"""
         substantive_defects = [
             str(d).strip()
             for d in (eval_report.detected_defects or [])
             if str(d).strip() and not str(d).strip().startswith("【拓扑检测元数据】")
         ]
-        has_deductions = bool(eval_report.deductions)
-
         judge_error_prefixes = (
             "模型未按标准 JSON 输出质检报告",
             "质检裁判模型调用异常",
@@ -103,7 +91,29 @@ class FlywheelPipelineService:
         has_error_defect = any(
             d.startswith(judge_error_prefixes) for d in substantive_defects
         )
-        if has_main_judge_error or has_error_defect:
+        return has_main_judge_error or has_error_defect
+
+    @staticmethod
+    def check_remediable_eval(
+        eval_report: Optional[InspectionReport],
+    ) -> Tuple[bool, str]:
+        """
+        校验质检报告是否具备可修复的实质异常:
+        1. 尚未执行质检（None）-> 不可直接修复；
+        2. 质检自身异常、思考截断（main_judge 正文为空/error）或 JSON 解析失败 -> 不可修复；
+        3. 无扣分项 (deductions) 且剔除仅供参考的【拓扑检测元数据】后无实质缺陷 -> 提示没有异常可以修复。
+        """
+        if eval_report is None:
+            return False, "当前样本尚未执行质检，暂无异常诊断可修复，请先质检或开启「修复前重新执行质检」。"
+
+        substantive_defects = [
+            str(d).strip()
+            for d in (eval_report.detected_defects or [])
+            if str(d).strip() and not str(d).strip().startswith("【拓扑检测元数据】")
+        ]
+        has_deductions = bool(eval_report.deductions)
+
+        if FlywheelPipelineService._is_judge_error_report(eval_report):
             return (
                 False,
                 "当前质检结果异常或输出被截断，未产生有效缺陷诊断，无法直接修复；请先重新质检（或开启「修复前重新执行质检」）。",
@@ -432,28 +442,9 @@ class FlywheelPipelineService:
 
         todo_items = []
         for idx, item in enumerate(input_records):
-            sid = str(item.get("id") or item.get("original_idx") or f"row_{idx}")
+            sid, _, matched_sc, chat_msgs = self._parse_dialogue_record_item(rule, item, idx)
             if sid in processed_ids:
                 continue
-
-            # 场景定义查找
-            scenario_id = item.get("scenario_id") or "default"
-            matched_sc = next(
-                (s for s in rule.scenarios if s.id == scenario_id),
-                PersonaDefinition(id=scenario_id, name="导入会话场景", instruction="保持原对话意图"),
-            )
-
-            # 解析 messages
-            raw_msg_dicts = item.get("messages", [])
-            chat_msgs = [
-                ChatMessage(
-                    role=m.get("role", "user"),
-                    content=m.get("content", ""),
-                    thinking=m.get("thinking", ""),
-                )
-                for m in raw_msg_dicts
-            ]
-
             todo_items.append((sid, matched_sc, chat_msgs))
 
         stats = {"total": len(input_records), "skipped": len(processed_ids), "gold": 0, "discarded": 0}
@@ -526,3 +517,238 @@ class FlywheelPipelineService:
             with open(target_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(out_obj, ensure_ascii=False) + "\n")
                 f.flush()
+
+    @staticmethod
+    def _parse_dialogue_record_item(
+        rule: UniversalRuleSchema,
+        item: Dict[str, Any],
+        idx: int,
+    ) -> Tuple[str, str, PersonaDefinition, List[ChatMessage]]:
+        """解析单条对话数据集样本，兼容顶层及 metadata 中的 scenario_id。"""
+        sid = str(item.get("id") or item.get("original_idx") or f"row_{idx}")
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        scenario_id = str(item.get("scenario_id") or meta.get("scenario_id") or "default")
+        matched_sc = next(
+            (s for s in rule.scenarios if s.id == scenario_id),
+            PersonaDefinition(id=scenario_id, name="导入会话场景", instruction="保持原对话意图"),
+        )
+        raw_msg_dicts = item.get("messages") or []
+        chat_msgs = [
+            ChatMessage(
+                role=m.get("role", "user"),
+                content=m.get("content", ""),
+                thinking=m.get("thinking", ""),
+            )
+            for m in raw_msg_dicts
+            if isinstance(m, dict)
+        ]
+        return sid, scenario_id, matched_sc, chat_msgs
+
+    @staticmethod
+    def _build_inspect_report_snapshot(
+        *,
+        task_id: str,
+        dataset_id: Optional[str],
+        dataset_path: Optional[str],
+        rule: UniversalRuleSchema,
+        judge_model_id: Optional[str],
+        total_target_samples: int,
+        ordered_samples: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """聚合当前已完成样本的质检打分汇总看板与明细报告。"""
+        pass_count = sum(1 for s in ordered_samples if s.get("verdict") == "PASS")
+        fail_count = sum(1 for s in ordered_samples if s.get("verdict") == "FAIL")
+        error_count = sum(1 for s in ordered_samples if s.get("verdict") == "ERROR")
+        valid_samples = [s for s in ordered_samples if s.get("verdict") in ("PASS", "FAIL")]
+        valid_count = len(valid_samples)
+
+        scores = [
+            int(s["score"])
+            for s in valid_samples
+            if s.get("score") is not None
+        ]
+        topo_pass_count = sum(1 for s in valid_samples if s.get("topology_valid") is True)
+
+        deduction_agg: Dict[str, Dict[str, Any]] = {}
+        for s in valid_samples:
+            for d in (s.get("deductions") or []):
+                if not isinstance(d, dict):
+                    continue
+                item_name = str(d.get("item") or "未命名扣分项").strip() or "未命名扣分项"
+                try:
+                    pts = int(round(float(d.get("points") or 0)))
+                except Exception:
+                    pts = 0
+                bucket = deduction_agg.setdefault(
+                    item_name, {"item": item_name, "count": 0, "total_points": 0}
+                )
+                bucket["count"] += 1
+                bucket["total_points"] += max(0, pts)
+
+        top_deductions = sorted(
+            deduction_agg.values(),
+            key=lambda x: (-x["count"], -x["total_points"], x["item"]),
+        )[:15]
+
+        summary = {
+            "total_samples": total_target_samples,
+            "completed_samples": len(ordered_samples),
+            "pass_count": pass_count,
+            "fail_count": fail_count,
+            "error_count": error_count,
+            "valid_count": valid_count,
+            "pass_rate": round(pass_count / valid_count, 4) if valid_count > 0 else 0.0,
+            "avg_score": round(sum(scores) / len(scores), 2) if scores else 0.0,
+            "min_score": min(scores) if scores else None,
+            "max_score": max(scores) if scores else None,
+            "topology_pass_rate": round(topo_pass_count / valid_count, 4) if valid_count > 0 else 0.0,
+            "top_deductions": top_deductions,
+        }
+        return {
+            "task_id": task_id,
+            "dataset_id": dataset_id,
+            "dataset_path": dataset_path,
+            "rule_id": rule.rule_id,
+            "rule_name": rule.project_name,
+            "judge_model_id": judge_model_id,
+            "pass_score_threshold": rule.inspection_rules.pass_score_threshold,
+            "summary": summary,
+            "samples": ordered_samples,
+        }
+
+    def batch_inspect_dataset(
+        self,
+        rule: UniversalRuleSchema,
+        input_records: List[Dict[str, Any]],
+        task_id: str,
+        dataset_id: Optional[str] = None,
+        dataset_path: Optional[str] = None,
+        judge_model_id: Optional[str] = None,
+        workers: int = 4,
+        limit: Optional[int] = None,
+        output_path: Optional[str] = None,
+        on_sample_done: Optional[
+            Callable[[Dict[str, Any], List[ChatMessage], Optional[InspectionReport], int, int], None]
+        ] = None,
+    ) -> Dict[str, Any]:
+        """
+        对纯对话数据集执行批量规则质检打分（只检不修）:
+        - 并发调用 UniversalJudgeEngine.evaluate_dialogue 执行 SOP 拓扑 + 红线 ∥ FAQ 双轨质检；
+        - 识别并隔离裁判异常样本（不计入 pass_rate / avg_score 分母）；
+        - 支持步进原子落盘至 output_path，并通过 on_sample_done 回调进度与可选飞轮入库。
+        """
+        if self.judge_engine is None:
+            raise RuntimeError("未提供质检法官模型适配器 (judge_adapter)，无法执行批量规则质检")
+
+        target_records = input_records[:limit] if limit and limit > 0 else input_records
+        total = len(target_records)
+        parsed_items = [
+            (idx, *self._parse_dialogue_record_item(rule, item, idx))
+            for idx, item in enumerate(target_records)
+        ]
+
+        results_by_idx: Dict[int, Dict[str, Any]] = {}
+        completed = 0
+
+        if output_path:
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+        def _flush_snapshot(ordered: List[Dict[str, Any]]) -> Dict[str, Any]:
+            snapshot = self._build_inspect_report_snapshot(
+                task_id=task_id,
+                dataset_id=dataset_id,
+                dataset_path=dataset_path,
+                rule=rule,
+                judge_model_id=judge_model_id,
+                total_target_samples=total,
+                ordered_samples=ordered,
+            )
+            if output_path:
+                tmp_path = f"{output_path}.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, output_path)
+            return snapshot
+
+        # 初始化骨架文件，确保轮询期间立即可读
+        if output_path:
+            with self._lock:
+                _flush_snapshot([])
+
+        def _inspect_one(
+            idx: int,
+            sid: str,
+            scenario_id: str,
+            sc: PersonaDefinition,
+            msgs: List[ChatMessage],
+        ) -> Tuple[int, Dict[str, Any], List[ChatMessage], Optional[InspectionReport]]:
+            turn_count = sum(1 for m in msgs if m.role != "system")
+            if not msgs or turn_count == 0:
+                entry = {
+                    "sample_id": sid,
+                    "scenario_id": scenario_id,
+                    "turn_count": 0,
+                    "score": None,
+                    "verdict": "ERROR",
+                    "topology_valid": False,
+                    "topology_error": "样本缺少有效对话消息",
+                    "node_trajectory": [],
+                    "deductions": [],
+                    "detected_defects": ["样本缺少有效对话消息"],
+                    "expert_comments": "样本 messages 为空或仅包含 system 消息，无法执行对话质检。",
+                }
+                return idx, entry, msgs, None
+
+            try:
+                rep = self.judge_engine.evaluate_dialogue(rule, sc, msgs)
+                is_err = self._is_judge_error_report(rep)
+                entry = {
+                    "sample_id": sid,
+                    "scenario_id": scenario_id,
+                    "turn_count": turn_count,
+                    "score": None if is_err else int(rep.score),
+                    "verdict": "ERROR" if is_err else rep.verdict,
+                    "topology_valid": False if is_err else bool(rep.topology_valid),
+                    "topology_error": rep.topology_error,
+                    "node_trajectory": list(rep.node_trajectory or []),
+                    "deductions": list(rep.deductions or []),
+                    "detected_defects": list(rep.detected_defects or []),
+                    "expert_comments": rep.expert_comments or "",
+                }
+                return idx, entry, msgs, rep
+            except Exception as exc:
+                entry = {
+                    "sample_id": sid,
+                    "scenario_id": scenario_id,
+                    "turn_count": turn_count,
+                    "score": None,
+                    "verdict": "ERROR",
+                    "topology_valid": False,
+                    "topology_error": str(exc),
+                    "node_trajectory": [],
+                    "deductions": [],
+                    "detected_defects": [f"质检执行异常: {exc}"],
+                    "expert_comments": f"质检执行异常: {exc}",
+                }
+                return idx, entry, msgs, None
+
+        if total == 0:
+            return _flush_snapshot([])
+
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            futures = [
+                executor.submit(_inspect_one, idx, sid, sc_id, sc, msgs)
+                for idx, sid, sc_id, sc, msgs in parsed_items
+            ]
+            for fut in as_completed(futures):
+                idx, entry, msgs, rep = fut.result()
+                with self._lock:
+                    results_by_idx[idx] = entry
+                    completed += 1
+                    ordered = [results_by_idx[i] for i in sorted(results_by_idx.keys())]
+                    _flush_snapshot(ordered)
+                if on_sample_done is not None:
+                    on_sample_done(entry, msgs, rep, completed, total)
+
+        final_ordered = [results_by_idx[i] for i in sorted(results_by_idx.keys())]
+        return _flush_snapshot(final_ordered)

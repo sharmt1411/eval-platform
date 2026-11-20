@@ -568,9 +568,140 @@ def batch_export_benchmark_cmd(
     emit_output(ctx, data)
 
 
+def _brief_inspect_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    """裁剪规则质检报告的逐样本明细，保留汇总指标与核心扣分标签以防爆上下文。"""
+    samples = report.get("samples") or []
+    compact_samples = []
+    for s in samples:
+        if not isinstance(s, dict):
+            continue
+        compact_samples.append({
+            "sample_id": s.get("sample_id"),
+            "scenario_id": s.get("scenario_id"),
+            "turn_count": s.get("turn_count"),
+            "score": s.get("score"),
+            "verdict": s.get("verdict"),
+            "topology_valid": s.get("topology_valid"),
+            "deduction_items": [
+                d.get("item") for d in (s.get("deductions") or []) if isinstance(d, dict) and d.get("item")
+            ],
+            "defect_count": len(s.get("detected_defects") or []),
+        })
+    copied = dict(report)
+    copied["samples"] = compact_samples
+    return copied
+
+
+@click.command("inspect-dataset")
+@click.option("--dataset-id", default=None, help="已登记数据集 ID（与 --dataset-path 二选一）")
+@click.option("--dataset-path", default=None, help="服务端对话数据集路径（与 --dataset-id 二选一）")
+@click.option("--rule-id", default=None, help="质检依据的场景规则 ID")
+@click.option("--judge-model-id", default=None, help="质检裁判模型 ID")
+@click.option("--workers", type=int, default=None, help="并发质检线程数")
+@click.option("--limit", type=int, default=None, help="仅质检前 N 条样本")
+@click.option("--save-to-flywheel/--no-save-to-flywheel", default=None, help="是否同步写入飞轮复核样本池")
+@click.option("--payload", "payload_file", default=None, help="完整 DatasetInspectRequest JSON 文件")
+@click.option("--payload-json", default=None, help="完整 DatasetInspectRequest JSON 字符串")
+@click.option("--wait", is_flag=True, help="提交后轮询等待直至批量质检完成")
+@click.option("--poll-interval", type=float, default=1.5, show_default=True, help="--wait 轮询间隔秒数")
+@click.option("--wait-timeout", type=float, default=600.0, show_default=True, help="--wait 最大等待秒数")
+@click.option("--brief", is_flag=True, help="搭配 --wait 使用：返回汇总看板与紧凑样本摘要")
+@click.pass_context
+def inspect_dataset_cmd(
+    ctx: click.Context,
+    dataset_id: Optional[str],
+    dataset_path: Optional[str],
+    rule_id: Optional[str],
+    judge_model_id: Optional[str],
+    workers: Optional[int],
+    limit: Optional[int],
+    save_to_flywheel: Optional[bool],
+    payload_file: Optional[str],
+    payload_json: Optional[str],
+    wait: bool,
+    poll_interval: float,
+    wait_timeout: float,
+    brief: bool,
+) -> None:
+    """对纯对话数据集执行批量规则质检打分（只检不修，不触发 AI 修复）"""
+    check_command_allowed(ctx, "flywheel.inspect-dataset")
+    body = load_payload(
+        payload_file,
+        payload_json,
+        {
+            "dataset_id": dataset_id,
+            "dataset_path": dataset_path,
+            "rule_id": rule_id,
+            "judge_model_id": judge_model_id,
+            "workers": workers,
+            "limit": limit,
+            "save_to_flywheel": save_to_flywheel,
+        },
+    )
+    if not body.get("dataset_id") and not body.get("dataset_path"):
+        raise CliError("MISSING_PARAM", "请提供 --dataset-id 或 --dataset-path", EXIT_API_ERROR)
+    if not body.get("rule_id") or not body.get("judge_model_id"):
+        raise CliError("MISSING_PARAM", "请提供 --rule-id 与 --judge-model-id", EXIT_API_ERROR)
+
+    client = ensure_client(ctx)
+    submit_res = client.request_json("POST", "/api/v1/flywheel/inspect-dataset", json_body=body)
+    if not wait or not isinstance(submit_res, dict) or not submit_res.get("task_id"):
+        emit_output(ctx, submit_res)
+        return
+
+    report_data = wait_for_task(
+        ctx,
+        client,
+        submit_res["task_id"],
+        poll_interval=poll_interval,
+        wait_timeout=wait_timeout,
+        label="flywheel_inspect",
+        fail_code="FLYWHEEL_INSPECT_FAILED",
+        status_endpoint_template="/api/v1/flywheel/inspect-tasks/{task_id}",
+    )
+    if brief and isinstance(report_data, dict):
+        report_data = _brief_inspect_report(report_data)
+    emit_output(ctx, report_data)
+
+
+@click.command("inspect-report")
+@click.argument("task_id")
+@click.option("--only-fail", is_flag=True, help="仅展示未通过 (FAIL/ERROR) 的样本明细")
+@click.option("--brief", is_flag=True, help="返回紧凑样本摘要，省略长文本评语与轨迹")
+@click.option("--limit", type=int, default=None, help="限制返回明细样本条数")
+@click.pass_context
+def inspect_report_cmd(
+    ctx: click.Context,
+    task_id: str,
+    only_fail: bool,
+    brief: bool,
+    limit: Optional[int],
+) -> None:
+    """查询数据集批量规则质检打分报告"""
+    check_command_allowed(ctx, "flywheel.inspect-report")
+    client = ensure_client(ctx)
+    data = client.request_json(
+        "GET",
+        f"/api/v1/flywheel/inspect-tasks/{quote_path_segment(task_id)}",
+    )
+    if isinstance(data, dict):
+        samples = data.get("samples") or []
+        if only_fail:
+            samples = [s for s in samples if isinstance(s, dict) and s.get("verdict") != "PASS"]
+        if limit is not None and limit >= 0:
+            samples = samples[:limit]
+        data = dict(data)
+        data["samples"] = samples
+        if brief:
+            data = _brief_inspect_report(data)
+    emit_output(ctx, data)
+
+
 def register_commands(group: click.Group) -> None:
     group.add_command(list_samples_cmd)
     group.add_command(batch_flywheel_cmd)
+    group.add_command(inspect_dataset_cmd)
+    group.add_command(inspect_report_cmd)
     group.add_command(judge_sample_cmd)
     group.add_command(batch_judge_cmd)
     group.add_command(remediate_sample_cmd)

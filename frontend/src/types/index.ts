@@ -339,6 +339,7 @@ export interface BenchmarkRunRequest {
   max_tokens?: number;
   ignore_sample_max_tokens?: boolean;
   sampling_config?: SamplingFilterConfig;
+  allow_unlabeled?: boolean;
 }
 
 export interface BenchmarkSummary {
@@ -624,6 +625,78 @@ export interface BatchExportSelectedRequest {
   sample_ids: string[];
   version_tag: string;
   inject_thinking: boolean;
+}
+
+export interface DatasetInspectRequest {
+  dataset_id?: string;
+  dataset_path?: string;
+  rule_id: string;
+  judge_model_id: string;
+  workers?: number;
+  limit?: number;
+  save_to_flywheel?: boolean;
+}
+
+export interface DatasetInspectDeductionAgg {
+  item: string;
+  count: number;
+  total_points: number;
+}
+
+export interface DatasetInspectSummary {
+  total_samples: number;
+  completed_samples: number;
+  pass_count: number;
+  fail_count: number;
+  error_count: number;
+  valid_count: number;
+  pass_rate: number;
+  avg_score: number;
+  min_score?: number | null;
+  max_score?: number | null;
+  topology_pass_rate: number;
+  top_deductions: DatasetInspectDeductionAgg[];
+}
+
+export interface DatasetInspectSampleResult {
+  sample_id: string;
+  scenario_id: string;
+  turn_count: number;
+  score: number | null;
+  verdict: 'PASS' | 'FAIL' | 'ERROR';
+  topology_valid: boolean;
+  topology_error?: string | null;
+  node_trajectory: string[];
+  deductions: Array<{ item?: string; points?: number; reason?: string; turn?: number }>;
+  detected_defects: string[];
+  expert_comments: string;
+}
+
+export interface DatasetInspectTaskReport {
+  id: string;
+  task_id: string;
+  task_type: string;
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+  progress: number;
+  error_message?: string;
+  created_at?: number;
+  finished_at?: number;
+  dataset_id?: string | null;
+  dataset_path?: string | null;
+  rule_id?: string | null;
+  rule_name?: string | null;
+  judge_model_id?: string | null;
+  pass_score_threshold?: number | null;
+  save_to_flywheel?: boolean;
+  saved_sample_count?: number;
+  progress_detail?: {
+    completed: number;
+    total: number;
+    current_sample_id?: string | null;
+  };
+  report_file?: string;
+  summary?: DatasetInspectSummary | null;
+  samples: DatasetInspectSampleResult[];
 }
 
 // ==========================================

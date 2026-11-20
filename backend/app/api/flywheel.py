@@ -6,6 +6,7 @@ import os
 import json
 import time
 import uuid
+import hashlib
 from typing import List, Dict, Any, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.orm import Session
@@ -30,6 +31,7 @@ from backend.app.schemas.flywheel import (
     UpdateBenchmarkSlicesRequest,
     ExportBenchmarkDatasetRequest,
     BatchExportBenchmarkRequest,
+    DatasetInspectRequest,
 )
 from backend.app.api.deps import get_adapter_and_config_by_model_id, load_rule_schema
 from backend.app.services.flywheel_service import FlywheelPipelineService
@@ -741,6 +743,284 @@ def trigger_batch_flywheel(
 
     background_tasks.add_task(_run_batch)
     return {"message": "批量飞轮治理任务已提交", "task_id": task_id}
+
+
+def _make_flywheel_inspect_sample_id(task_id: str, sample_id: str) -> str:
+    """生成不超过 64 字符的唯一飞轮样本主键，避免同数据集多次质检入库发生主键冲突。"""
+    candidate = f"{task_id}_{sample_id}"
+    if len(candidate) <= 64:
+        return candidate
+    digest = hashlib.md5(sample_id.encode("utf-8")).hexdigest()[:16]
+    return f"{task_id}_{digest}"
+
+
+def _resolve_inspect_dataset_path(
+    db: Session,
+    dataset_id: Optional[str],
+    dataset_path: Optional[str],
+) -> Tuple[Optional[str], str]:
+    """解析待质检对话数据集路径，支持传 dataset_id 或 dataset_path。"""
+    did = (dataset_id or "").strip() or None
+    dpath = (dataset_path or "").strip() or None
+    if not did and not dpath:
+        raise HTTPException(status_code=400, detail="请提供 dataset_id 或 dataset_path")
+
+    if did and not dpath:
+        rec = db.query(DatasetRecord).filter(DatasetRecord.id == did).first()
+        real_path = rec.file_path if rec else os.path.join(settings.DATASETS_DIR, f"{did}.jsonl")
+    else:
+        real_path = str(dpath)
+        if not os.path.isabs(real_path):
+            real_path = os.path.join(settings.BASE_DIR, real_path)
+        if not did:
+            rec_by_path = db.query(DatasetRecord).filter(DatasetRecord.file_path == real_path).first()
+            if rec_by_path:
+                did = rec_by_path.id
+            else:
+                fname = os.path.basename(real_path)
+                did = fname[:-6] if fname.endswith(".jsonl") else fname
+
+    if not os.path.exists(real_path):
+        raise HTTPException(status_code=404, detail=f"找不到指定数据集文件: {real_path}")
+    return did, real_path
+
+
+@router.post("/inspect-dataset")
+def inspect_dataset_by_rule(
+    payload: DatasetInspectRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    对纯对话数据集执行批量规则质检打分（只检不修）:
+    - 复用 SOP 拓扑 + 节点检查点 + 红线 ∥ FAQ 双轨规则质检；
+    - 步进落盘结构化汇总与逐样本打分明细至 data/runs/inspect_<task_id>.json；
+    - 可选 save_to_flywheel=True 同步写入飞轮样本池供后续人工复核或修复。
+    """
+    rule = load_rule_schema(db, payload.rule_id)
+    # 预检裁判模型是否存在，避免后台静默失败
+    get_adapter_and_config_by_model_id(db, payload.judge_model_id)
+    resolved_dataset_id, real_path = _resolve_inspect_dataset_path(
+        db, payload.dataset_id, payload.dataset_path
+    )
+
+    records: List[Dict[str, Any]] = []
+    try:
+        with open(real_path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                line_s = line.strip()
+                if not line_s:
+                    continue
+                obj = json.loads(line_s)
+                if not isinstance(obj, dict):
+                    raise ValueError(f"第 {line_no} 行不是合法 JSON 对象")
+                records.append(obj)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"数据集解析失败: {str(e)}")
+
+    if not records:
+        raise HTTPException(status_code=400, detail="数据集为空，无可质检样本")
+
+    target_count = min(len(records), payload.limit) if payload.limit else len(records)
+    task_id = f"insp_{str(uuid.uuid4())[:8]}"
+    report_file = os.path.join(settings.RUNS_DIR, f"inspect_{task_id}.json")
+    os.makedirs(settings.RUNS_DIR, exist_ok=True)
+
+    initial_meta = {
+        "dataset_id": resolved_dataset_id,
+        "dataset_path": real_path,
+        "rule_id": rule.rule_id,
+        "rule_name": rule.project_name,
+        "judge_model_id": payload.judge_model_id,
+        "report_file": report_file,
+        "save_to_flywheel": bool(payload.save_to_flywheel),
+        "saved_sample_count": 0,
+        "progress_detail": {"completed": 0, "total": target_count, "current_sample_id": None},
+    }
+    rec = TaskRecord(
+        id=task_id,
+        task_type="flywheel_inspect",
+        status="PENDING",
+        progress=0.0,
+        result_json=json.dumps(initial_meta, ensure_ascii=False),
+    )
+    db.add(rec)
+    db.commit()
+
+    def _run_inspect() -> None:
+        bg_db = SessionLocal()
+        task = bg_db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
+        if not task:
+            bg_db.close()
+            return
+        task.status = "RUNNING"
+        bg_db.commit()
+
+        saved_count = 0
+        try:
+            judge_adapter, judge_config = get_adapter_and_config_by_model_id(
+                bg_db, payload.judge_model_id
+            )
+            pipeline = FlywheelPipelineService(
+                judge_adapter=judge_adapter,
+                remediate_adapter=None,
+                judge_config=judge_config,
+            )
+
+            def _on_sample_done(
+                entry: Dict[str, Any],
+                msgs: List[ChatMessage],
+                rep: Optional[InspectionReport],
+                completed: int,
+                total: int,
+            ) -> None:
+                nonlocal saved_count
+                p_db = SessionLocal()
+                try:
+                    t = p_db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
+                    if payload.save_to_flywheel and rep is not None and entry.get("verdict") != "ERROR":
+                        fw_id = _make_flywheel_inspect_sample_id(task_id, str(entry["sample_id"]))
+                        standard_raw: List[ChatMessage] = list(msgs)
+                        if not standard_raw or standard_raw[0].role != "system":
+                            standard_raw = [
+                                ChatMessage(role="system", content=rule.bot_config.system_prompt)
+                            ] + standard_raw
+                        fw_status = (
+                            "GOLD_PASS"
+                            if FlywheelPipelineService.is_gold_pass(
+                                rep, rule.inspection_rules.pass_score_threshold
+                            )
+                            else "PENDING"
+                        )
+                        existing_fw = (
+                            p_db.query(FlywheelSampleRecord)
+                            .filter(FlywheelSampleRecord.id == fw_id)
+                            .first()
+                        )
+                        if existing_fw is None:
+                            raw_dicts: List[Dict[str, Any]] = [
+                                {"role": m.role, "content": m.content, **({"thinking": m.thinking} if m.thinking else {})}
+                                for m in standard_raw
+                            ]
+                            fw_rec = FlywheelSampleRecord(
+                                id=fw_id,
+                                task_id=task_id,
+                                rule_id=rule.rule_id,
+                                scenario_id=str(entry.get("scenario_id") or "default"),
+                                status=fw_status,
+                                score=int(rep.score),
+                                raw_messages_json=json.dumps(raw_dicts, ensure_ascii=False),
+                                initial_eval_json=json.dumps(rep.model_dump(), ensure_ascii=False),
+                                reviewer_comment=f"来自数据集规则质检 ({resolved_dataset_id or task_id})",
+                                updated_at=int(time.time()),
+                            )
+                            p_db.add(fw_rec)
+                            saved_count += 1
+
+                    if t:
+                        t.progress = round(completed / max(total, 1), 4)
+                        cur_res = json.loads(t.result_json or "{}")
+                        cur_res["progress_detail"] = {
+                            "completed": completed,
+                            "total": total,
+                            "current_sample_id": entry.get("sample_id"),
+                        }
+                        cur_res["saved_sample_count"] = saved_count
+                        t.result_json = json.dumps(cur_res, ensure_ascii=False)
+                    p_db.commit()
+                except Exception:
+                    p_db.rollback()
+                finally:
+                    p_db.close()
+
+            report = pipeline.batch_inspect_dataset(
+                rule=rule,
+                input_records=records,
+                task_id=task_id,
+                dataset_id=resolved_dataset_id,
+                dataset_path=real_path,
+                judge_model_id=payload.judge_model_id,
+                workers=payload.workers,
+                limit=payload.limit,
+                output_path=report_file,
+                on_sample_done=_on_sample_done,
+            )
+
+            task.status = "COMPLETED"
+            task.progress = 1.0
+            cur_res = json.loads(task.result_json or "{}")
+            cur_res.update({
+                "summary": report.get("summary", {}),
+                "report_file": report_file,
+                "saved_sample_count": saved_count,
+                "progress_detail": {
+                    "completed": target_count,
+                    "total": target_count,
+                    "current_sample_id": None,
+                },
+            })
+            task.result_json = json.dumps(cur_res, ensure_ascii=False)
+            task.finished_at = int(time.time())
+            bg_db.commit()
+        except Exception as e:
+            task.status = "FAILED"
+            task.error_message = str(e)
+            task.finished_at = int(time.time())
+            bg_db.commit()
+        finally:
+            bg_db.close()
+
+    background_tasks.add_task(_run_inspect)
+    return {
+        "message": "数据集批量规则质检任务已提交（只检不修）",
+        "task_id": task_id,
+        "dataset_id": resolved_dataset_id,
+        "total_samples": target_count,
+    }
+
+
+@router.get("/inspect-tasks/{task_id}")
+def get_inspect_dataset_task(task_id: str, db: Session = Depends(get_db)):
+    """查询批量规则质检任务状态、汇总指标与逐样本打分报告。"""
+    task = db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="未找到该质检任务")
+
+    parsed_res = json.loads(task.result_json or "{}")
+    report_file = parsed_res.get("report_file") or os.path.join(
+        settings.RUNS_DIR, f"inspect_{task_id}.json"
+    )
+
+    report_data: Dict[str, Any] = {}
+    if report_file and os.path.exists(report_file):
+        try:
+            with open(report_file, "r", encoding="utf-8") as f:
+                report_data = json.load(f)
+        except Exception:
+            report_data = {}
+
+    return {
+        "id": task.id,
+        "task_id": task.id,
+        "task_type": task.task_type,
+        "status": task.status,
+        "progress": task.progress,
+        "error_message": task.error_message,
+        "created_at": task.created_at,
+        "finished_at": task.finished_at,
+        "dataset_id": report_data.get("dataset_id") or parsed_res.get("dataset_id"),
+        "dataset_path": report_data.get("dataset_path") or parsed_res.get("dataset_path"),
+        "rule_id": report_data.get("rule_id") or parsed_res.get("rule_id"),
+        "rule_name": report_data.get("rule_name") or parsed_res.get("rule_name"),
+        "judge_model_id": report_data.get("judge_model_id") or parsed_res.get("judge_model_id"),
+        "pass_score_threshold": report_data.get("pass_score_threshold"),
+        "save_to_flywheel": bool(parsed_res.get("save_to_flywheel", False)),
+        "saved_sample_count": parsed_res.get("saved_sample_count", 0),
+        "progress_detail": parsed_res.get("progress_detail"),
+        "report_file": report_file,
+        "summary": report_data.get("summary") or parsed_res.get("summary"),
+        "samples": report_data.get("samples", []),
+    }
 
 
 @router.get("/samples")

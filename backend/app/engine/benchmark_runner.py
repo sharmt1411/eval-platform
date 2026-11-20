@@ -140,6 +140,33 @@ def check_objective_rules(
     return {"passed": passed, "details": details}
 
 
+def has_sample_eval_criteria(sample: BenchmarkSample) -> bool:
+    """判断单条样本是否至少包含一项客观正则约束或主观裁判标准 (reference / rubric)。"""
+    has_regex = any(isinstance(p, str) and bool(p.strip()) for p in (sample.regex_constraints or []))
+    if has_regex:
+        return True
+    if sample.reference and str(sample.reference).strip():
+        return True
+    if isinstance(sample.rubric, str) and sample.rubric.strip():
+        return True
+    if isinstance(sample.rubric, RubricConfig):
+        r = sample.rubric
+        if (
+            bool(r.must_contain)
+            or bool(r.forbidden)
+            or bool(r.regex_patterns)
+            or bool(r.require_json)
+            or bool(r.judge_criteria and str(r.judge_criteria).strip())
+        ):
+            return True
+    return False
+
+
+def has_dataset_eval_criteria(samples: List[BenchmarkSample]) -> bool:
+    """判断评测集是否至少存在一条具备答案标准或正则约束的样本。"""
+    return any(has_sample_eval_criteria(s) for s in samples)
+
+
 class BenchmarkRunner:
     """常规数据集评测执行引擎"""
 

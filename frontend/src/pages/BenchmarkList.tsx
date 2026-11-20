@@ -117,6 +117,15 @@ export const BenchmarkList: React.FC = () => {
   const watchedModelLine = Form.useWatch('model_line', runForm);
   const watchedVersionTag = Form.useWatch('version_tag', runForm);
   const watchedBenchmarkModelId = Form.useWatch('benchmark_model_id', runForm);
+  const watchedAllowUnlabeled = Form.useWatch('allow_unlabeled', runForm) || false;
+
+  const selectedDatasetRecord = useMemo(
+    () => datasets.find((d) => d.file_path === watchedDatasetPath),
+    [datasets, watchedDatasetPath]
+  );
+  const isSelectedUnlabeledTrainingDataset = Boolean(
+    selectedDatasetRecord && selectedDatasetRecord.dataset_type !== 'benchmark'
+  );
 
   // 常规评测裁判 Prompt 调试弹窗状态
   const [judgeDebugVisible, setJudgeDebugVisible] = useState<boolean>(false);
@@ -346,6 +355,7 @@ export const BenchmarkList: React.FC = () => {
         max_tokens: 4096,
         ignore_sample_max_tokens: false,
         sampling_enabled: false,
+        allow_unlabeled: false,
         pass_threshold_x: 3,
         interval_step_s: 1,
         max_interval_n: 5,
@@ -385,6 +395,7 @@ export const BenchmarkList: React.FC = () => {
       max_tokens: 4096,
       ignore_sample_max_tokens: false,
       sampling_enabled: false,
+      allow_unlabeled: false,
       pass_threshold_x: 3,
       interval_step_s: 1,
       max_interval_n: 5,
@@ -427,6 +438,7 @@ export const BenchmarkList: React.FC = () => {
       max_tokens: task.max_tokens || 4096,
       ignore_sample_max_tokens: !!task.ignore_sample_max_tokens,
       sampling_enabled: sCfg ? sCfg.enabled : false,
+      allow_unlabeled: false,
       pass_threshold_x: sCfg?.pass_threshold_x ?? 3,
       interval_step_s: sCfg?.interval_step_s ?? 1,
       max_interval_n: sCfg?.max_interval_n ?? 5,
@@ -593,6 +605,7 @@ export const BenchmarkList: React.FC = () => {
         workers: values.workers || 4,
         max_tokens: globalMaxTokens,
         ignore_sample_max_tokens: !!values.ignore_sample_max_tokens,
+        allow_unlabeled: !!values.allow_unlabeled,
         sampling_config: values.sampling_enabled
           ? {
               enabled: true,
@@ -614,7 +627,7 @@ export const BenchmarkList: React.FC = () => {
       await loadTasks();
       navigate(`/benchmarks/${res.task_id}`);
     } catch (e: any) {
-      message.error(`提交失败: ${e.message}`);
+      message.error(`提交失败: ${e.response?.data?.detail || e.message}`);
     } finally {
       setSubmitting(false);
     }
@@ -1080,7 +1093,10 @@ export const BenchmarkList: React.FC = () => {
               options={[
                 ...datasets.map((d) => ({
                   value: d.file_path,
-                  label: `${d.name} (${d.sample_count}条 · ${d.dataset_type})`,
+                  label:
+                    d.dataset_type === 'benchmark'
+                      ? `${d.name} (${d.sample_count}条 · 基准考题集)`
+                      : `${d.name} (${d.sample_count}条 · ⚠️ ${d.dataset_type} 纯对话语料，建议改走规则质检)`,
                 })),
                 {
                   value: 'data/datasets/demo_benchmark.jsonl',
@@ -1093,6 +1109,50 @@ export const BenchmarkList: React.FC = () => {
               ]}
             />
           </Form.Item>
+
+          {isSelectedUnlabeledTrainingDataset && (
+            <Alert
+              type="warning"
+              showIcon
+              className="mb-2"
+              message="当前选择的是「纯对话训练语料」，而非包含答案标准/正则的基准考题集"
+              description={
+                <div className="space-y-2 text-xs">
+                  <div>
+                    常规评测仅对具备 <code className="font-mono">reference</code>、<code className="font-mono">rubric</code> 或{' '}
+                    <code className="font-mono">regex_constraints</code> 的考题执行打分；纯对话语料直接评测会被后端拦截以防产生假阳性 100% PASS。
+                  </div>
+                  <div className="flex items-center justify-between flex-wrap gap-2 pt-1">
+                    <Button
+                      size="small"
+                      type="primary"
+                      onClick={() => {
+                        setDrawerVisible(false);
+                        navigate('/datasets');
+                      }}
+                    >
+                      前往数据集中心执行「规则质检打分」
+                    </Button>
+                    <Form.Item
+                      name="allow_unlabeled"
+                      valuePropName="checked"
+                      className="m-0"
+                    >
+                      <Switch
+                        checkedChildren="已放行无标准集(仅测速)"
+                        unCheckedChildren="默认拦截无标准集"
+                      />
+                    </Form.Item>
+                  </div>
+                  {watchedAllowUnlabeled && (
+                    <div className="text-amber-700 font-medium">
+                      已开启强行放行：本次仅用于模型连通性或生成吞吐测速，通过率仅供参考。
+                    </div>
+                  )}
+                </div>
+              }
+            />
+          )}
 
           {/* 智能阶梯降频与抽样策略配置卡片 */}
           <div className="p-3.5 bg-gradient-to-r from-purple-50/70 to-indigo-50/70 border border-purple-200 rounded-lg space-y-3">

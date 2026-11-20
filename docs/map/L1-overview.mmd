@@ -33,6 +33,7 @@ flowchart TB
   sg_judge_users -->|"业务模型推理"| adapters
   judge_engine -->|"裁判推理"| adapters
   simulation -->|"样本入飞轮治理池"| flywheel
+  dataset_center -->|"纯对话集规则质检"| flywheel
 
   adapters -->|"统一调用与重试"| ext_services
   judge_engine -.->|"⚠️faq_retriever直连"| ext_services

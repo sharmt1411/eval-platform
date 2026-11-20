@@ -178,6 +178,10 @@ class BenchmarkRunRequest(BaseModel):
     sampling_config: Optional[SamplingFilterConfig] = Field(
         None, description="智能阶梯降频抽样配置，None 或 enabled=False 时为全量评测"
     )
+    allow_unlabeled: bool = Field(
+        False,
+        description="是否允许无 reference/rubric/regex_constraints 的纯对话集跳过校验（仅用于连通性或生成速度测试）",
+    )
 
 
 class SampleEvalResult(BaseModel):

@@ -25,7 +25,7 @@ from backend.app.schemas import (
     ResetTrackerResponse,
     UnifiedChatRequest,
 )
-from backend.app.engine.benchmark_runner import BenchmarkRunner
+from backend.app.engine.benchmark_runner import BenchmarkRunner, has_dataset_eval_criteria
 from backend.app.engine.benchmark_sampler import BenchmarkSamplingEngine
 from backend.app.engine.judge import UniversalJudgeEngine
 from backend.app.adapters.factory import AdapterFactory
@@ -61,6 +61,28 @@ def _sanitize_model_configs(model_configs: Optional[List[Dict[str, Any]]]) -> Op
     return sanitized
 
 
+def _load_benchmark_samples_from_file(real_path: str) -> List[BenchmarkSample]:
+    """从 JSONL 文件解析评测样本；若纯对话语料缺少 id 字段则自动补全行号索引，确保格式解析与拦截提示一致。"""
+    samples: List[BenchmarkSample] = []
+    with open(real_path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line_str = line.strip()
+            if not line_str:
+                continue
+            obj = json.loads(line_str)
+            if not isinstance(obj, dict):
+                raise ValueError(f"第 {line_no} 行不是合法 JSON 对象")
+            if not str(obj.get("id") or "").strip():
+                orig_idx = obj.get("original_idx")
+                obj["id"] = (
+                    str(orig_idx).strip()
+                    if orig_idx is not None and str(orig_idx).strip()
+                    else f"row_{line_no}"
+                )
+            samples.append(BenchmarkSample(**obj))
+    return samples
+
+
 def _execute_benchmark_task(task_id: str, payload: BenchmarkRunRequest):
     from backend.app.models import SessionLocal
 
@@ -81,12 +103,7 @@ def _execute_benchmark_task(task_id: str, payload: BenchmarkRunRequest):
         if not os.path.isabs(real_path):
             real_path = os.path.join(settings.BASE_DIR, real_path)
 
-        samples = []
-        with open(real_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    samples.append(BenchmarkSample(**json.loads(line)))
+        samples = _load_benchmark_samples_from_file(real_path)
 
         total_dataset_samples = len(samples)
         samples_to_run = samples
@@ -403,6 +420,29 @@ def trigger_benchmark(
                 status_code=400,
                 detail="填写评测版本号 (version_tag) 时，必须同时指定基准模型线或参评基准模型",
             )
+
+    if not payload.allow_unlabeled:
+        real_path = payload.dataset_path
+        if not os.path.isabs(real_path):
+            real_path = os.path.join(settings.BASE_DIR, real_path)
+        if os.path.exists(real_path):
+            try:
+                preview_samples = _load_benchmark_samples_from_file(real_path)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"数据集格式解析失败，无法启动常规评测: {str(e)}",
+                )
+            if preview_samples and not has_dataset_eval_criteria(preview_samples):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "当前数据集为无答案标准的纯对话语料（全部样本均缺少 reference、rubric 与 regex_constraints），"
+                        "常规评测会跳过所有校验导致假阳性 100% PASS。请改用「规则质检打分」"
+                        "（POST /api/v1/flywheel/inspect-dataset 或数据集中心 → 训练与对话语料 → 规则质检打分）；"
+                        "如仅需测试模型连通性或生成速度，请显式传入 allow_unlabeled=True。"
+                    ),
+                )
 
     task_id = str(uuid.uuid4())[:8]
     res_file = os.path.join(settings.RUNS_DIR, f"bench_{task_id}.json")

@@ -53,6 +53,7 @@ from backend.app.schemas.flywheel import (
     BatchRemediateRequest,
     BatchExportSelectedRequest,
     BatchFlywheelRunRequest,
+    DatasetInspectRequest,
 )
 
 __all__ = [
@@ -102,4 +103,5 @@ __all__ = [
     "BatchRemediateRequest",
     "BatchExportSelectedRequest",
     "BatchFlywheelRunRequest",
+    "DatasetInspectRequest",
 ]

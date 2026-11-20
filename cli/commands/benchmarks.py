@@ -29,6 +29,7 @@ from cli.utils import (
 @click.option("--workers", type=int, default=None, help="并发线程数")
 @click.option("--max-tokens", type=int, default=None, help="统一最大生成 Token 上限")
 @click.option("--ignore-sample-max-tokens/--no-ignore-sample-max-tokens", default=None, help="是否忽略样本级 max_new_tokens 限制")
+@click.option("--allow-unlabeled/--no-allow-unlabeled", default=None, help="是否放行无 reference/rubric/regex 的纯对话集（仅作测速/连通性用途）")
 @click.option("--sampling-json", default=None, help="智能降频抽样配置 JSON")
 @click.option("--payload", "payload_file", default=None, help="完整 BenchmarkRunRequest JSON 文件")
 @click.option("--payload-json", default=None, help="完整 BenchmarkRunRequest JSON 字符串")
@@ -44,6 +45,7 @@ def run_benchmark_cmd(
     workers: Optional[int],
     max_tokens: Optional[int],
     ignore_sample_max_tokens: Optional[bool],
+    allow_unlabeled: Optional[bool],
     sampling_json: Optional[str],
     payload_file: Optional[str],
     payload_json: Optional[str],
@@ -59,6 +61,7 @@ def run_benchmark_cmd(
         "workers": workers,
         "max_tokens": max_tokens,
         "ignore_sample_max_tokens": ignore_sample_max_tokens,
+        "allow_unlabeled": allow_unlabeled,
     }
     if model_ids:
         overrides["model_ids"] = parse_str_list(model_ids)

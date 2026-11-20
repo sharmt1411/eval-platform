@@ -1,0 +1,22 @@
+%% title: 纯对话数据集批量规则质检打分与评测边界治理方案图
+flowchart TB
+  dataset_center["数据集中心\nfrontend/src/pages/DatasetCenter.tsx\n新增纯对话语料质检入口"]:::changed
+  bench_list["常规评测工作台\nfrontend/src/pages/BenchmarkList.tsx\n提示无标准集改走质检"]:::changed
+  cli_flywheel["飞轮 CLI 命令\ncli/commands/flywheel.py\n新增inspect-dataset命令"]:::changed
+  agent_skill["Agent 技能指南\ncli/SKILL.md\n区分常规评测与规则质检"]:::changed
+  api_benchmarks["常规评测路由\nbackend/app/api/benchmarks.py\n拦截无答案标准的纯对话集"]:::changed
+  api_flywheel["飞轮 API 路由\nbackend/app/api/flywheel.py\n新增批量质检打分接口"]:::changed
+  flywheel_service["飞轮编排服务\nbackend/app/services/flywheel_service.py:FlywheelPipelineService\n新增批量只检不修打分"]:::changed
+  judge_engine["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine"]
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\nTaskRecord/FlywheelSample")]
+  runs_dir[("本地数据与报告目录\ndata/runs\n含data/datasets数据集")]
+
+  dataset_center -->|"纯对话集发起规则质检"| api_flywheel
+  bench_list -->|"常规评测提交与校验"| api_benchmarks
+  cli_flywheel -->|"提交轮询并查质检报告"| api_flywheel
+  agent_skill -.->|"指导选用评测或质检"| cli_flywheel
+  api_benchmarks -->|"校验答案标准防误跑"| runs_dir
+  api_flywheel -->|"异步执行只检不修打分"| flywheel_service
+  flywheel_service -->|"逐条SOP与FAQ质检"| judge_engine
+  api_flywheel -->|"记录任务与可选入飞轮"| sqlite_db
+  api_flywheel -->|"步进落盘质检打分报告"| runs_dir
