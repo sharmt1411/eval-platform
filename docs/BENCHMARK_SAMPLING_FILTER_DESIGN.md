@@ -61,7 +61,7 @@ flowchart TD
     
     B -- "开启智能降频" --> D{"同 (dataset, model_line, version_tag)\n是否已有未撤销抽题快照?"}
     D -- "有 (同版本重跑/对比)" --> E["直接复用首次抽出的题单\n(保证可比性，且本轮不推进 m)"]
-    D -- "无 (新版本首次评测)" --> G["从流水表聚合当前 model_line 下每题的 c 与 m\n(单题内容指纹变动则自动重置该题战绩)\n计算目标间隔 I_i:\n• 若 not is_holdout 或 force_due 或 c < x ➔ I_i = 1\n• 若 is_holdout 且 c ≥ x ➔ I_i = min(N, 1 + (c − x + 1) × s)"]
+    D -- "无 (新版本首次评测)" --> G["从流水表聚合当前 model_line 下每题的 c 与 m\n(单题内容指纹变动则自动重置该题战绩)\n计算目标间隔 I_i (留出题与普通题统一):\n• 若 force_due 或 c < x ➔ I_i = 1\n• 若 c ≥ x ➔ I_i = min(N, 1 + (c − x + 1) × s)"]
     
     G --> H1["🔴 必测攻坚池 (I_i == 1)\n100% 必入"]
     G --> H2["🟡 触顶保底池 (I_i > 1 且 m + 1 ≥ N)\n100% 强制必入"]
@@ -169,7 +169,7 @@ flowchart TD
   N_valid_sampled     = 本轮实测有效题数 (N_sampled − N_api_error)
   N_passed            = 本轮实测通过总题数
 
-  N_cooldown_tested   = 本轮实测样本中属于熟题池 (c_old ≥ x 且 is_holdout=True) 的有效题数
+  N_cooldown_tested   = 本轮实测样本中属于熟题池 (c_old ≥ x，含留出题与普通题) 的有效题数
   N_cooldown_passed   = 本轮实测熟题中通过的题数
   N_cooldown_failed   = N_cooldown_tested − N_cooldown_passed (即：熟题退化/遗忘题数)
 

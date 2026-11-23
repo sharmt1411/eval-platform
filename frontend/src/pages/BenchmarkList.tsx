@@ -605,6 +605,11 @@ export const BenchmarkList: React.FC = () => {
       const resolvedModelLine = values.model_line?.trim() || (bmModel ? bmModel.model_name || bmModel.id : bmId);
 
       const hfValue = values.holdout_filter || 'all';
+      if (samplingPreview && samplingPreview.holdout_filter === hfValue && samplingPreview.sampled_samples === 0) {
+        message.warning('当前题型过滤范围内暂无可评测样本，请调整题型过滤或更换评测集');
+        return;
+      }
+
       const payload: BenchmarkRunRequest = {
         dataset_path: values.dataset_path,
         model_configs: modelConfigsPayload,
@@ -1315,7 +1320,8 @@ export const BenchmarkList: React.FC = () => {
               <div className="p-2.5 bg-purple-50/80 rounded border border-purple-200">
                 <div className="flex items-center justify-between mb-1.5">
                   <span className="text-3xs font-bold text-purple-900 flex items-center gap-1">
-                    <ExperimentOutlined /> 本次预计评测样本分布与算力节省试算
+                    <ExperimentOutlined />{' '}
+                    {watchedSamplingEnabled ? '本次预计评测样本分布与算力节省试算' : '本次按题型过滤预计参评样本分布'}
                   </span>
                   <Space size="small">
                     <Button
@@ -1325,19 +1331,21 @@ export const BenchmarkList: React.FC = () => {
                       onClick={refreshSamplingPreview}
                       className="text-3xs text-purple-700 h-6 px-1.5"
                     >
-                      刷新试算
+                      {watchedSamplingEnabled ? '刷新试算' : '刷新统计'}
                     </Button>
-                    <Popconfirm
-                      title="确定重置该数据集在流水表中的复测战绩？"
-                      description="重置后将作废对应流水记录，所有题目将回归全新状态 (c=0) 必测。"
-                      onConfirm={handleResetDatasetTracker}
-                      okText="确认重置"
-                      cancelText="取消"
-                    >
-                      <Button size="small" danger type="link" className="text-3xs h-6 px-1">
-                        🔄 重置战绩归零
-                      </Button>
-                    </Popconfirm>
+                    {watchedSamplingEnabled && (
+                      <Popconfirm
+                        title="确定重置该数据集在流水表中的复测战绩？"
+                        description="重置后将作废对应流水记录，所有题目将回归全新状态 (c=0) 必测。"
+                        onConfirm={handleResetDatasetTracker}
+                        okText="确认重置"
+                        cancelText="取消"
+                      >
+                        <Button size="small" danger type="link" className="text-3xs h-6 px-1">
+                          🔄 重置战绩归零
+                        </Button>
+                      </Popconfirm>
+                    )}
                   </Space>
                 </div>
 
@@ -1348,35 +1356,49 @@ export const BenchmarkList: React.FC = () => {
                         范围题量: <span className="font-mono">{samplingPreview.total_samples}</span> 题 ➔ 本次实测:{' '}
                         <span className="font-mono text-purple-700">{samplingPreview.sampled_samples}</span> 题
                       </span>
-                      <div className="flex items-center gap-1">
-                        {samplingPreview.is_rerun_same_version && (
-                          <Tag color="cyan" className="m-0 font-semibold">
-                            📌 命中同版本快照复用
+                      {watchedSamplingEnabled && (
+                        <div className="flex items-center gap-1">
+                          {samplingPreview.is_rerun_same_version && (
+                            <Tag color="cyan" className="m-0 font-semibold">
+                              📌 命中同版本快照复用
+                            </Tag>
+                          )}
+                          <Tag color="purple" className="m-0 font-bold">
+                            节省 {samplingPreview.saved_compute_ratio}% 算力
                           </Tag>
-                        )}
-                        <Tag color="purple" className="m-0 font-bold">
-                          节省 {samplingPreview.saved_compute_ratio}% 算力
-                        </Tag>
-                      </div>
+                        </div>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-1.5 flex-wrap text-3xs font-mono">
-                      <Tag color="red" className="m-0">
-                        🔴 必测攻坚: {samplingPreview.active_pool_count} 题
-                      </Tag>
-                      <Tag color="gold" className="m-0">
-                        🟡 触顶必测: {samplingPreview.hard_cap_pool_count} 题
-                      </Tag>
-                      <Tag color="blue" className="m-0">
-                        🟢 降频轮巡: {samplingPreview.regular_cooldown_count} 题
-                      </Tag>
-                      <Tag color="default" className="m-0">
-                        💤 本轮休眠免测: {samplingPreview.skipped_samples} 题
-                      </Tag>
+                      {watchedSamplingEnabled && (
+                        <>
+                          <Tag color="red" className="m-0">
+                            🔴 必测攻坚: {samplingPreview.active_pool_count} 题
+                          </Tag>
+                          <Tag color="gold" className="m-0">
+                            🟡 触顶必测: {samplingPreview.hard_cap_pool_count} 题
+                          </Tag>
+                          <Tag color="blue" className="m-0">
+                            🟢 降频轮巡: {samplingPreview.regular_cooldown_count} 题
+                          </Tag>
+                          <Tag color="default" className="m-0">
+                            💤 本轮休眠免测: {samplingPreview.skipped_samples} 题
+                          </Tag>
+                        </>
+                      )}
                       <Tag color="geekblue" className="m-0">
                         🏷️ 留出题: {samplingPreview.sampled_holdout_count ?? samplingPreview.holdout_count ?? 0}/{samplingPreview.holdout_count ?? 0} ｜ 普通题: {samplingPreview.sampled_non_holdout_count ?? samplingPreview.non_holdout_count ?? 0}/{samplingPreview.non_holdout_count ?? 0}
                       </Tag>
                     </div>
+                    {samplingPreview.sampled_samples === 0 && (
+                      <Alert
+                        type="warning"
+                        showIcon
+                        className="text-3xs py-1 px-2"
+                        message="当前题型过滤范围内没有可评测样本，请调整题型过滤或更换评测集。"
+                      />
+                    )}
                     {samplingPreview.notice && (
                       <div className="text-3xs text-purple-800">{samplingPreview.notice}</div>
                     )}

@@ -435,10 +435,9 @@ class BenchmarkRunner:
             g_est_full: Optional[float] = None
             if is_benchmark_model and g_ds_tot > 0:
                 if group_skipped > 0:
-                    eff_ret = g_cd_ret if g_cd_ret is not None else cd_retention
-                    if eff_ret is not None:
+                    if g_cd_tested > 0 and g_cd_ret is not None:
                         eff_denom = max(g_ds_tot - g_err, 1)
-                        g_est_full = round((g_pass + group_skipped * eff_ret) / eff_denom, 4)
+                        g_est_full = round((g_pass + group_skipped * g_cd_ret) / eff_denom, 4)
                 else:
                     g_est_full = g_rate
 

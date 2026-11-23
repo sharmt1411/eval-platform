@@ -31,6 +31,12 @@ from cli.utils import (
 @click.option("--ignore-sample-max-tokens/--no-ignore-sample-max-tokens", default=None, help="是否忽略样本级 max_new_tokens 限制")
 @click.option("--allow-unlabeled/--no-allow-unlabeled", default=None, help="是否放行无 reference/rubric/regex 的纯对话集（仅作测速/连通性用途）")
 @click.option("--sampling-json", default=None, help="智能降频抽样配置 JSON")
+@click.option(
+    "--holdout-filter",
+    default=None,
+    type=click.Choice(["all", "holdout_only", "non_holdout_only"], case_sensitive=False),
+    help="按题型属性过滤: all(全部) / holdout_only(仅留出题) / non_holdout_only(仅普通题)",
+)
 @click.option("--payload", "payload_file", default=None, help="完整 BenchmarkRunRequest JSON 文件")
 @click.option("--payload-json", default=None, help="完整 BenchmarkRunRequest JSON 字符串")
 @click.option("--wait", is_flag=True, help="提交后轮询等待直至评测结束")
@@ -47,6 +53,7 @@ def run_benchmark_cmd(
     ignore_sample_max_tokens: Optional[bool],
     allow_unlabeled: Optional[bool],
     sampling_json: Optional[str],
+    holdout_filter: Optional[str],
     payload_file: Optional[str],
     payload_json: Optional[str],
     wait: bool,
@@ -69,6 +76,11 @@ def run_benchmark_cmd(
         overrides["sampling_config"] = parse_json_arg(sampling_json, "--sampling-json")
 
     body = load_payload(payload_file, payload_json, overrides)
+    if holdout_filter is not None:
+        sc = dict(body.get("sampling_config") or {})
+        sc.setdefault("enabled", False)
+        sc["holdout_filter"] = holdout_filter.lower()
+        body["sampling_config"] = sc
     if not body.get("dataset_path"):
         raise CliError("MISSING_PARAM", "请提供 --dataset-path 或在 --payload 中包含 dataset_path", EXIT_API_ERROR)
 
@@ -297,6 +309,12 @@ def revoke_ledger_cmd(ctx: click.Context, task_id: str) -> None:
 @click.option("--interval-step-s", type=int, default=None, help="冷却间隔步长 S")
 @click.option("--max-interval-n", type=int, default=None, help="最大冷却周期 N")
 @click.option("--min-pass-score", type=float, default=None, help="判定通过最低分")
+@click.option(
+    "--holdout-filter",
+    default=None,
+    type=click.Choice(["all", "holdout_only", "non_holdout_only"], case_sensitive=False),
+    help="按题型属性过滤: all(全部) / holdout_only(仅留出题) / non_holdout_only(仅普通题)",
+)
 @click.option("--sampling-json", default=None, help="SamplingFilterConfig JSON")
 @click.option("--payload", "payload_file", default=None, help="完整请求 JSON 文件")
 @click.option("--payload-json", default=None, help="完整请求 JSON 字符串")
@@ -312,6 +330,7 @@ def preview_sampling_cmd(
     interval_step_s: Optional[int],
     max_interval_n: Optional[int],
     min_pass_score: Optional[float],
+    holdout_filter: Optional[str],
     sampling_json: Optional[str],
     payload_file: Optional[str],
     payload_json: Optional[str],
@@ -334,9 +353,11 @@ def preview_sampling_cmd(
         "interval_step_s": interval_step_s,
         "max_interval_n": max_interval_n,
         "min_pass_score": min_pass_score,
+        "holdout_filter": holdout_filter.lower() if holdout_filter else None,
     }.items():
         if v is not None:
             sc[k] = v
+    sc.setdefault("enabled", False)
     sc.setdefault("tracker_model_keys", [])
     body["sampling_config"] = sc
     if not body.get("dataset_path"):

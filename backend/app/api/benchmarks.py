@@ -430,28 +430,46 @@ def trigger_benchmark(
                 detail="填写评测版本号 (version_tag) 时，必须同时指定基准模型线或参评基准模型",
             )
 
-    if not payload.allow_unlabeled:
-        real_path = payload.dataset_path
-        if not os.path.isabs(real_path):
-            real_path = os.path.join(settings.BASE_DIR, real_path)
-        if os.path.exists(real_path):
-            try:
-                preview_samples = _load_benchmark_samples_from_file(real_path)
-            except Exception as e:
+    real_path = payload.dataset_path
+    if not os.path.isabs(real_path):
+        real_path = os.path.join(settings.BASE_DIR, real_path)
+    if os.path.exists(real_path):
+        try:
+            preview_samples = _load_benchmark_samples_from_file(real_path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"数据集格式解析失败，无法启动常规评测: {str(e)}",
+            )
+
+        hf = getattr(payload.sampling_config, "holdout_filter", "all") if payload.sampling_config else "all"
+        if hf == "holdout_only":
+            filtered_preview = [s for s in preview_samples if s.is_holdout]
+            if not filtered_preview:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"数据集格式解析失败，无法启动常规评测: {str(e)}",
+                    detail="当前评测集内没有符合条件的留出题 (is_holdout=true)，无法发起仅留出题评测",
                 )
-            if preview_samples and not has_dataset_eval_criteria(preview_samples):
+        elif hf == "non_holdout_only":
+            filtered_preview = [s for s in preview_samples if not s.is_holdout]
+            if not filtered_preview:
                 raise HTTPException(
                     status_code=400,
-                    detail=(
-                        "当前数据集为无答案标准的纯对话语料（全部样本均缺少 reference、rubric 与 regex_constraints），"
-                        "常规评测会跳过所有校验导致假阳性 100% PASS。请改用「规则质检打分」"
-                        "（POST /api/v1/flywheel/inspect-dataset 或数据集中心 → 训练与对话语料 → 规则质检打分）；"
-                        "如仅需测试模型连通性或生成速度，请显式传入 allow_unlabeled=True。"
-                    ),
+                    detail="当前评测集内没有符合条件的普通题 (is_holdout=false)，无法发起仅普通题评测",
                 )
+        else:
+            filtered_preview = preview_samples
+
+        if not payload.allow_unlabeled and filtered_preview and not has_dataset_eval_criteria(filtered_preview):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "当前数据集为无答案标准的纯对话语料（全部样本均缺少 reference、rubric 与 regex_constraints），"
+                    "常规评测会跳过所有校验导致假阳性 100% PASS。请改用「规则质检打分」"
+                    "（POST /api/v1/flywheel/inspect-dataset 或数据集中心 → 训练与对话语料 → 规则质检打分）；"
+                    "如仅需测试模型连通性或生成速度，请显式传入 allow_unlabeled=True。"
+                ),
+            )
 
     task_id = str(uuid.uuid4())[:8]
     res_file = os.path.join(settings.RUNS_DIR, f"bench_{task_id}.json")

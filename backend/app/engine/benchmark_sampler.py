@@ -112,10 +112,11 @@ class BenchmarkSamplingEngine:
         dataset_path: str,
         model_line: str,
         version_tag: str,
+        holdout_filter: str = "all",
     ) -> Optional[Tuple[List[str], Set[str]]]:
-        """查询同一 (dataset_path, model_line, version_tag) 是否已存在未撤销的抽题快照，返回 (sampled_ids, known_ids)"""
+        """查询同一 (dataset_path, model_line, version_tag) 且兼容当前 holdout_filter 范围的未撤销抽题快照，返回 (sampled_ids, known_ids)"""
         norm_path = cls.normalize_dataset_path(dataset_path)
-        existing = (
+        candidates = (
             db.query(BenchmarkRunLedger)
             .filter(
                 BenchmarkRunLedger.dataset_path == norm_path,
@@ -124,23 +125,32 @@ class BenchmarkSamplingEngine:
                 BenchmarkRunLedger.is_revoked == False,  # noqa: E712
             )
             .order_by(BenchmarkRunLedger.created_at.asc(), BenchmarkRunLedger.id.asc())
-            .first()
+            .all()
         )
-        if not existing:
-            return None
-        try:
-            ids = json.loads(existing.sampled_ids_json or "[]")
-            if not isinstance(ids, list):
-                return None
-            known_ids: Set[str] = set(ids)
-            records = json.loads(existing.records_json or "[]")
-            if isinstance(records, list):
-                for rec in records:
-                    if isinstance(rec, dict) and rec.get("sample_id"):
-                        known_ids.add(rec["sample_id"])
-            return ids, known_ids
-        except Exception:
-            return None
+        req_hf = holdout_filter or "all"
+        for existing in candidates:
+            try:
+                ids = json.loads(existing.sampled_ids_json or "[]")
+                if not isinstance(ids, list):
+                    continue
+                records = json.loads(existing.records_json or "[]")
+                ledger_scopes = {
+                    rec.get("holdout_filter")
+                    for rec in records
+                    if isinstance(rec, dict) and rec.get("holdout_filter")
+                } if isinstance(records, list) else set()
+                # 历史未记录 holdout_filter 的旧流水视为 "all"；存在范围标记时仅允许相同范围或全量快照向子集复用
+                if ledger_scopes and req_hf not in ledger_scopes and "all" not in ledger_scopes:
+                    continue
+                known_ids: Set[str] = set(ids)
+                if isinstance(records, list):
+                    for rec in records:
+                        if isinstance(rec, dict) and rec.get("sample_id"):
+                            known_ids.add(rec["sample_id"])
+                return ids, known_ids
+            except Exception:
+                continue
+        return None
 
     @classmethod
     def find_same_version_snapshot(
@@ -195,12 +205,10 @@ class BenchmarkSamplingEngine:
             .all()
         )
 
-        seen_versions: Set[str] = set()
+        seen_versions_by_sample: Dict[str, Set[str]] = {}
 
         for ledger in ledgers:
             v_tag = ledger.version_tag
-            is_rerun = v_tag in seen_versions
-            seen_versions.add(v_tag)
 
             try:
                 records = json.loads(ledger.records_json or "[]")
@@ -225,6 +233,10 @@ class BenchmarkSamplingEngine:
                     tr.last_score = None
                     tr.last_content_hash = curr_fp
                     continue
+
+                sample_seen = seen_versions_by_sample.setdefault(sid, set())
+                is_rerun = v_tag in sample_seen
+                sample_seen.add(v_tag)
 
                 if rec.get("skipped"):
                     if not is_rerun:
@@ -389,7 +401,9 @@ class BenchmarkSamplingEngine:
         # 检查是否命中同 (dataset_path, model_line, version_tag) 快照复用
         snapshot_detail: Optional[Tuple[List[str], Set[str]]] = None
         if db is not None and dataset_path and model_line and version_tag:
-            snapshot_detail = cls.find_same_version_snapshot_detail(db, dataset_path, model_line, version_tag)
+            snapshot_detail = cls.find_same_version_snapshot_detail(
+                db, dataset_path, model_line, version_tag, holdout_filter=holdout_filter
+            )
 
         if snapshot_detail is not None:
             snapshot_ids, known_ids = snapshot_detail
@@ -741,6 +755,7 @@ class BenchmarkSamplingEngine:
         norm_path = cls.normalize_dataset_path(dataset_path)
         now_iso = datetime.now().isoformat()
         min_score = config.min_pass_score
+        holdout_filter = getattr(config, "holdout_filter", "all") or "all"
         cooldown_set = cooldown_sample_ids or set()
         fp_map = {s.id: cls.compute_sample_fingerprint(s) for s in all_samples}
 
@@ -764,6 +779,7 @@ class BenchmarkSamplingEngine:
                 records.append({
                     "sample_id": s.id,
                     "content_hash": fp_map.get(s.id),
+                    "holdout_filter": holdout_filter,
                     "skipped": False,
                     "was_cooldown": s.id in cooldown_set,
                     "status": "API_ERROR",
@@ -780,6 +796,7 @@ class BenchmarkSamplingEngine:
             records.append({
                 "sample_id": s.id,
                 "content_hash": fp_map.get(s.id),
+                "holdout_filter": holdout_filter,
                 "skipped": False,
                 "was_cooldown": s.id in cooldown_set,
                 "status": "PASS" if all_qualified else "FAIL",
@@ -796,6 +813,7 @@ class BenchmarkSamplingEngine:
             records.append({
                 "sample_id": s.id,
                 "content_hash": fp_map.get(s.id),
+                "holdout_filter": holdout_filter,
                 "skipped": True,
                 "was_cooldown": True,
                 "status": "SKIPPED",

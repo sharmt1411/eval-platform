@@ -843,6 +843,18 @@ def test_cli_end_to_end_all_groups(
     assert sbs_fail["matched_count"] == 1
     assert "cli_q2" in sbs_fail["samples"]
 
+    rc, sbs_holdout, _ = _run_main(
+        ["--in-process", "benchmark", "side-by-side", task_id, "--holdout-filter", "holdout_only", "--summary-only"],
+        capsys,
+    )
+    assert rc == 0 and sbs_holdout["matched_count"] == 3
+
+    rc, sbs_reg, _ = _run_main(
+        ["--in-process", "benchmark", "side-by-side", task_id, "--holdout-filter", "non_holdout_only", "--summary-only"],
+        capsys,
+    )
+    assert rc == 0 and sbs_reg["matched_count"] == 0
+
     rc, p_samp, _ = _run_main(
         [
             "--in-process",
@@ -857,6 +869,20 @@ def test_cli_end_to_end_all_groups(
         capsys,
     )
     assert rc == 0 and p_samp["total_samples"] == 3
+
+    rc, p_samp_h, _ = _run_main(
+        [
+            "--in-process",
+            "benchmark",
+            "preview-sampling",
+            "--dataset-path",
+            ds_file_path,
+            "--holdout-filter",
+            "holdout_only",
+        ],
+        capsys,
+    )
+    assert rc == 0 and p_samp_h["holdout_filter"] == "holdout_only" and p_samp_h["non_holdout_count"] == 0
 
     rc, dbg_j, _ = _run_main(
         ["--in-process", "benchmark", "debug-judge", "--dataset-path", ds_file_path, "--sample-id", "cli_q1"],

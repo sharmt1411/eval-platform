@@ -718,3 +718,208 @@ def test_skipped_fingerprint_reset_and_snapshot_new_sample_append():
         db.query(BenchmarkRunLedger).filter(BenchmarkRunLedger.dataset_path == norm_p).delete()
         db.commit()
         db.close()
+
+
+def test_holdout_group_no_cross_type_retention_fallback():
+    """验证当某题型组存在休眠熟题但本轮未抽中该题型熟题时，绝不跨题型借用全局熟题保持率"""
+    runner = BenchmarkRunner()
+    # 2道留出题 (s_h0 必败, s_h1 必过, 均非本轮抽中的熟题) + 2道普通题 (s_r0 必过且为本轮抽中熟题)
+    samples = [
+        BenchmarkSample(id="s_h0", is_holdout=True, messages=[ChatMessage(role="user", content="h0")], regex_constraints=["MOCK_MUST_FAIL"]),
+        BenchmarkSample(id="s_h1", is_holdout=True, messages=[ChatMessage(role="user", content="h1")]),
+        BenchmarkSample(id="s_r0", is_holdout=False, messages=[ChatMessage(role="user", content="r0")]),
+    ]
+    bm_cfg = ModelEvalConfig(model_id="bm_only", display_name="基准模型", provider_type="mock")
+    sampling_cfg = SamplingFilterConfig(
+        enabled=True,
+        model_line="bm_line_no_fallback",
+        version_tag="v1.0",
+        benchmark_model_id="bm_only",
+    )
+    # 留出题有 5 道休眠，但本轮抽中熟题仅 s_r0 (普通题) -> 全局 cd_retention=1.0, 但留出题 g_cd_tested=0
+    matrix = runner.run_multi_model_matrix(
+        samples=samples,
+        model_configs=[bm_cfg],
+        workers=1,
+        dataset_total_samples=8,
+        skipped_mastered_samples=5,
+        sampling_config=sampling_cfg,
+        cooldown_sample_ids={"s_r0"},
+        skipped_holdout_samples=5,
+        skipped_regular_samples=0,
+    )
+    bm_sum = matrix["summaries"]["基准模型"]
+    assert bm_sum["cooldown_retention_rate"] == 1.0
+    assert bm_sum["holdout_pass_rate"] == 0.5
+    assert bm_sum["holdout_estimated_full_pass_rate"] is None
+    assert bm_sum["regular_pass_rate"] == 1.0
+    assert bm_sum["regular_estimated_full_pass_rate"] == 1.0
+
+
+def test_holdout_filter_partition_and_same_version_scope_isolation():
+    """验证 holdout_filter 抽样过滤及同 version_tag 下切换过滤范围时不发生快照与 miss_streak 串扰"""
+    init_db()
+    db = SessionLocal()
+    unique_tag = uuid.uuid4().hex[:8]
+    ds_path = f"data/datasets/temp_hf_scope_{unique_tag}.jsonl"
+    norm_p = BenchmarkSamplingEngine.normalize_dataset_path(ds_path)
+    model_line = f"line_hf_{unique_tag}"
+    dummy_resp = UnifiedChatResponse(content="OK", thinking="")
+
+    def _pass(sid: str):
+        return SampleEvalResult(
+            sample_id=sid,
+            category="test",
+            model_id="m_1",
+            response=dummy_resp,
+            objective_passed=True,
+            status="PASS",
+        )
+
+    samples = [
+        BenchmarkSample(id="h1", is_holdout=True, messages=[ChatMessage(role="user", content="留出1")]),
+        BenchmarkSample(id="h2", is_holdout=True, messages=[ChatMessage(role="user", content="留出2")]),
+        BenchmarkSample(id="r1", is_holdout=False, messages=[ChatMessage(role="user", content="普通1")]),
+        BenchmarkSample(id="r2", is_holdout=False, messages=[ChatMessage(role="user", content="普通2")]),
+    ]
+
+    try:
+        # 1. 不开降频 + 仅留出题 / 仅普通题过滤
+        sel_h, skp_h, st_h = BenchmarkSamplingEngine.partition_samples(
+            samples,
+            SamplingFilterConfig(enabled=False, holdout_filter="holdout_only"),
+            db=db,
+            dataset_path=ds_path,
+        )
+        assert [s.id for s in sel_h] == ["h1", "h2"]
+        assert skp_h == []
+        assert st_h["total_samples"] == 2
+        assert st_h["sampled_holdout_count"] == 2
+        assert st_h["sampled_non_holdout_count"] == 0
+
+        # 2. 先在 v1 (all) 全量通过, pass_threshold_x=1 -> 4题全部进入熟题池 (I=2)
+        cfg_v1_all = SamplingFilterConfig(
+            enabled=True, pass_threshold_x=1, model_line=model_line, version_tag="v1", benchmark_model_id="m_1"
+        )
+        BenchmarkSamplingEngine.record_run_ledger(
+            db=db,
+            task_id=f"tsk_v1_all_{unique_tag}",
+            dataset_path=ds_path,
+            config=cfg_v1_all,
+            all_samples=samples,
+            selected_samples=samples,
+            skipped_samples=[],
+            results_by_sample_id={s.id: [_pass(s.id)] for s in samples},
+        )
+
+        # 3. v2 先跑 holdout_only: 仅抽留出题 (至少1题实测, 另1题跳过)
+        cfg_v2_h = SamplingFilterConfig(
+            enabled=True,
+            pass_threshold_x=1,
+            holdout_filter="holdout_only",
+            model_line=model_line,
+            version_tag="v2",
+            benchmark_model_id="m_1",
+        )
+        sel2_h, skp2_h, st2_h = BenchmarkSamplingEngine.partition_samples(
+            samples, cfg_v2_h, db=db, dataset_path=ds_path
+        )
+        assert {s.id for s in sel2_h} | {s.id for s in skp2_h} == {"h1", "h2"}
+        assert len(sel2_h) == 1 and len(skp2_h) == 1
+        assert st2_h["is_rerun_same_version"] is False
+        BenchmarkSamplingEngine.record_run_ledger(
+            db=db,
+            task_id=f"tsk_v2_h_{unique_tag}",
+            dataset_path=ds_path,
+            config=cfg_v2_h,
+            all_samples=samples,
+            selected_samples=sel2_h,
+            skipped_samples=skp2_h,
+            results_by_sample_id={s.id: [_pass(s.id)] for s in sel2_h},
+        )
+
+        # 4. 同版本 v2 再跑 non_holdout_only: 绝不可命中 v2 holdout_only 快照，且普通休眠题必须正常推进 miss_streak=1
+        cfg_v2_r = SamplingFilterConfig(
+            enabled=True,
+            pass_threshold_x=1,
+            holdout_filter="non_holdout_only",
+            model_line=model_line,
+            version_tag="v2",
+            benchmark_model_id="m_1",
+        )
+        sel2_r, skp2_r, st2_r = BenchmarkSamplingEngine.partition_samples(
+            samples, cfg_v2_r, db=db, dataset_path=ds_path
+        )
+        assert st2_r["is_rerun_same_version"] is False
+        assert {s.id for s in sel2_r} | {s.id for s in skp2_r} == {"r1", "r2"}
+        assert len(sel2_r) == 1 and len(skp2_r) == 1
+        BenchmarkSamplingEngine.record_run_ledger(
+            db=db,
+            task_id=f"tsk_v2_r_{unique_tag}",
+            dataset_path=ds_path,
+            config=cfg_v2_r,
+            all_samples=samples,
+            selected_samples=sel2_r,
+            skipped_samples=skp2_r,
+            results_by_sample_id={s.id: [_pass(s.id)] for s in sel2_r},
+        )
+
+        tr_after = BenchmarkSamplingEngine.aggregate_trackers_from_ledgers(
+            db=db, dataset_path=ds_path, model_line=model_line, samples=samples, pass_threshold_x=1
+        )
+        skipped_r_id = skp2_r[0].id
+        assert tr_after[skipped_r_id].miss_streak == 1
+
+        # 5. 同版本 v2 再跑 all 也不得误命中此前 holdout_only 的单边快照
+        sel2_all, skp2_all, st2_all = BenchmarkSamplingEngine.partition_samples(
+            samples,
+            SamplingFilterConfig(
+                enabled=True,
+                pass_threshold_x=1,
+                holdout_filter="all",
+                model_line=model_line,
+                version_tag="v2",
+                benchmark_model_id="m_1",
+            ),
+            db=db,
+            dataset_path=ds_path,
+        )
+        assert st2_all["is_rerun_same_version"] is False
+    finally:
+        db.query(BenchmarkRunLedger).filter(BenchmarkRunLedger.dataset_path == norm_p).delete()
+        db.commit()
+        db.close()
+
+
+def test_api_run_rejects_empty_holdout_filter(tmp_path):
+    """验证 /api/v1/benchmarks/run 当 holdout_filter 过滤后无任何可测样本时返回 400 拦截"""
+    init_db()
+    client = TestClient(app)
+    tmp_ds = tmp_path / "only_regular.jsonl"
+    tmp_ds.write_text(
+        json.dumps(
+            {
+                "id": "reg_1",
+                "category": "通用",
+                "is_holdout": False,
+                "messages": [{"role": "user", "content": "问题1"}],
+                "reference": "答案1",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    resp = client.post(
+        "/api/v1/benchmarks/run",
+        json={
+            "dataset_path": str(tmp_ds),
+            "model_ids": ["mock_m"],
+            "sampling_config": {
+                "enabled": False,
+                "holdout_filter": "holdout_only",
+            },
+        },
+    )
+    assert resp.status_code == 400
+    assert "留出题" in resp.json()["detail"]
