@@ -296,6 +296,7 @@ def filter_side_by_side(
     filter_type: str = "all",
     category: Optional[str] = None,
     difficulty: Optional[str] = None,
+    holdout_filter: str = "all",
     sample_id: Optional[str] = None,
     offset: int = 0,
     limit: Optional[int] = None,
@@ -309,6 +310,7 @@ def filter_side_by_side(
         "API_ERROR_SAMPLES": 0,
     }
     norm_filter = (filter_type or "all").strip().lower()
+    norm_holdout = (holdout_filter or "all").strip().lower()
     matched: List[Tuple[str, Dict[str, Any], str, bool]] = []
 
     for sid, entry in sbs_map.items():
@@ -325,6 +327,11 @@ def filter_side_by_side(
         if category and entry.get("category") != category:
             continue
         if difficulty and entry.get("difficulty") != difficulty:
+            continue
+        is_holdout_val = bool(entry.get("is_holdout", False))
+        if norm_holdout == "holdout_only" and not is_holdout_val:
+            continue
+        if norm_holdout == "non_holdout_only" and is_holdout_val:
             continue
         if norm_filter in ("divergence", "disagree") and klass != "DIVERGENCE":
             continue
@@ -358,6 +365,7 @@ def filter_side_by_side(
                 "sample_id": sid,
                 "category": entry.get("category"),
                 "difficulty": entry.get("difficulty"),
+                "is_holdout": bool(entry.get("is_holdout", False)),
                 "classification": klass,
                 "has_api_error": has_api_err,
                 "models": model_brief,

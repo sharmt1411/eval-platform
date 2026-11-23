@@ -1,7 +1,7 @@
 # 常规评测集动态阶梯降频抽取与复测战绩治理设计方案
 
-> **方案版本**：v2.1（业务对齐定稿版）  
-> **文档定位**：定义评测平台在执行常规基准评测（[`BenchmarkRunner`](../backend/app/engine/benchmark_runner.py)）时的**动态样本过滤、阶梯降频抽取与复测战绩治理机制**。
+> **方案版本**：v2.2（学会遗忘与题型解耦 + 留出/普通分层通过率报告版）  
+> **文档定位**：定义评测平台在执行常规基准评测（[`BenchmarkRunner`](../backend/app/engine/benchmark_runner.py)）时的**动态样本过滤、阶梯降频抽取、复测战绩治理与留出/普通分层通过率报告机制**。
 
 ---
 
@@ -10,10 +10,11 @@
 1. **固定阶梯冷却间隔 + 紧迫度配额平滑**：
    - 采用**固定阶梯冷却间隔 + 紧迫度配额平滑**，默认连续通过门槛设为 **`x = 3`**（连续 3 个不同版本通过后开始拉长间隔），步长 `s = 1`，最大间隔上限为 `N`（默认 `N = 5`），稳态下熟题池每轮测试量严格收敛于 `熟题总量 ÷ N`。
    - 因存在 `N` 轮触顶强制必测机制，任意熟题最多休眠 `N - 1` 轮必定复测，从算法上保证无“永久休眠盲区”。
-2. **留出题（`is_holdout`）源头互斥与降频资格约束**：
+2. **留出题（`is_holdout`）与普通题均支持学会、遗忘与评测过滤，报告按题型区分通过率**：
    - `is_holdout: bool = False` 作为题目固有属性置于 `BenchmarkSample` 顶层（移出战绩状态，重置战绩不丢失）。
-   - **训/测源头隔离**：飞轮对话一旦切题导出至 Benchmark 评测集，源对话自动标记 `exported_to_benchmark = True`，生成的考题标记 `is_holdout = True`；飞轮导出 SFT 训练集时**默认强制排除所有已进评测集的同源对话**。外部导入的纯评测集可在导入时一键标记为 `is_holdout = True`。
-   - **非留出题禁止降频**：若某道题 `is_holdout == False`（与训练集同源），其通过表现仅反映记忆背诵，不计入泛化降频（目标间隔恒为 `I = 1`）。
+   - **学会与遗忘与题型解耦**：无论是留出题（`is_holdout = True`）还是普通题（`is_holdout = False`），都可以学会（连续达标 `c ≥ x` 后进入熟题降频池，按 `I_i = min(N, 1 + (c − x + 1) × s)` 阶梯降频，并非每轮必出）和遗忘（复测 `FAIL` 退化归零 `c = 0`，回退必测攻坚池），也都支持按战绩池与题型属性做评测抽样过滤与数据集导出过滤。
+   - **评测报告分层统计通过率**：在评测汇总报告（`BenchmarkSummary`）及对比视窗中，除总体通过率外，独立区分统计并展示**留出题通过率（`holdout_pass_rate`）**与**普通题通过率（`regular_pass_rate`）**。
+   - **训/测源头隔离**：飞轮对话一旦切题导出至 Benchmark 评测集，源对话自动标记 `exported_to_benchmark = True`，生成的考题标记 `is_holdout = True`；飞轮导出 SFT 训练集时**默认强制排除所有已进评测集的同源对话**。外部导入的评测集可在导入时选择标记为留出题或普通题。
 3. **战绩脱离 JSONL，按「单模型线 + 追加式流水表」独立存储**：
    - 数据集 `.jsonl` 保持 100% 纯净只读，避免并发覆写损坏、不同模型线战绩串台及误操作无法回滚。
    - 在 SQLite 新增只追加的评测战绩流水表 `benchmark_run_ledgers`（记录 `task_id, dataset_path, model_line, version_tag, sampled_ids_json, records_json, is_revoked`），按 `(dataset_path, model_line)` 动态聚合每道题的 `c` 和 `m`，支持按 `task_id` 一键撤销单次误操作。
@@ -125,13 +126,11 @@ flowchart TD
    若指定了 `(dataset_path, model_line, version_tag)`，先查询 `benchmark_run_ledgers` 中是否存在该三元组未撤销的抽题快照 `sampled_ids_json`。若存在，**直接返回该题单快照**，并标记 `is_rerun_same_version = True`（后续不推进休眠题的 `m`）。
 2. **动态聚合战绩与单题指纹校验**：
    按时间顺序重放当前 `(dataset_path, model_line)` 下未撤销流水，聚合每题的 `passed_versions`、`miss_streak`、`force_due`；若某题当前内容指纹与 `last_content_hash` 不一致，重置该题战绩为初始态。
-3. **计算单题目标间隔 `I_i`**：
+3. **计算单题目标间隔 `I_i`（留出题与普通题统一法则）**：
    ```text
-   若 sample.is_holdout == False （非留出题，与训练集同源）：
-       I_i = 1
    若 tracker.force_due == True 或 c_i < x：
        I_i = 1
-   若 sample.is_holdout == True 且 c_i ≥ x：
+   若 c_i ≥ x（无论 sample.is_holdout 为 True 还是 False）：
        I_i = min(N, 1 + (c_i − x + 1) × s)
    ```
 4. **三池分流抽取**：

@@ -110,6 +110,7 @@ export const BenchmarkList: React.FC = () => {
   const [samplingPreview, setSamplingPreview] = useState<SamplingPreviewResponse | null>(null);
   const [previewLoading, setPreviewLoading] = useState<boolean>(false);
   const watchedSamplingEnabled = Form.useWatch('sampling_enabled', runForm) || false;
+  const watchedHoldoutFilter = Form.useWatch('holdout_filter', runForm) || 'all';
   const watchedDatasetPath = Form.useWatch('dataset_path', runForm);
   const watchedThresholdX = Form.useWatch('pass_threshold_x', runForm);
   const watchedIntervalStepS = Form.useWatch('interval_step_s', runForm);
@@ -239,7 +240,8 @@ export const BenchmarkList: React.FC = () => {
   const refreshSamplingPreview = async () => {
     const dsPath = runForm.getFieldValue('dataset_path');
     const enabled = runForm.getFieldValue('sampling_enabled');
-    if (!dsPath || !enabled) {
+    const hf = runForm.getFieldValue('holdout_filter') || 'all';
+    if (!dsPath || (!enabled && hf === 'all')) {
       setSamplingPreview(null);
       return;
     }
@@ -247,11 +249,12 @@ export const BenchmarkList: React.FC = () => {
     try {
       const bmId = runForm.getFieldValue('benchmark_model_id') || null;
       const cfg: SamplingFilterConfig = {
-        enabled: true,
+        enabled: !!enabled,
         pass_threshold_x: runForm.getFieldValue('pass_threshold_x') ?? 3,
         interval_step_s: runForm.getFieldValue('interval_step_s') ?? 1,
         max_interval_n: runForm.getFieldValue('max_interval_n') ?? 5,
         min_pass_score: runForm.getFieldValue('min_pass_score') || null,
+        holdout_filter: hf,
         model_line: runForm.getFieldValue('model_line') || null,
         version_tag: runForm.getFieldValue('version_tag') || null,
         benchmark_model_id: bmId,
@@ -270,17 +273,18 @@ export const BenchmarkList: React.FC = () => {
   };
 
   useEffect(() => {
-    if (drawerVisible && watchedSamplingEnabled && watchedDatasetPath) {
+    if (drawerVisible && (watchedSamplingEnabled || watchedHoldoutFilter !== 'all') && watchedDatasetPath) {
       const timer = setTimeout(() => {
         refreshSamplingPreview();
       }, 300);
       return () => clearTimeout(timer);
-    } else if (!watchedSamplingEnabled) {
+    } else if (!watchedSamplingEnabled && watchedHoldoutFilter === 'all') {
       setSamplingPreview(null);
     }
   }, [
     drawerVisible,
     watchedSamplingEnabled,
+    watchedHoldoutFilter,
     watchedDatasetPath,
     watchedThresholdX,
     watchedIntervalStepS,
@@ -355,6 +359,7 @@ export const BenchmarkList: React.FC = () => {
         max_tokens: 4096,
         ignore_sample_max_tokens: false,
         sampling_enabled: false,
+        holdout_filter: 'all',
         allow_unlabeled: false,
         pass_threshold_x: 3,
         interval_step_s: 1,
@@ -438,6 +443,7 @@ export const BenchmarkList: React.FC = () => {
       max_tokens: task.max_tokens || 4096,
       ignore_sample_max_tokens: !!task.ignore_sample_max_tokens,
       sampling_enabled: sCfg ? sCfg.enabled : false,
+      holdout_filter: sCfg?.holdout_filter ?? 'all',
       allow_unlabeled: false,
       pass_threshold_x: sCfg?.pass_threshold_x ?? 3,
       interval_step_s: sCfg?.interval_step_s ?? 1,
@@ -598,6 +604,7 @@ export const BenchmarkList: React.FC = () => {
       const bmModel = bmId ? models.find((x) => x.id === bmId) : undefined;
       const resolvedModelLine = values.model_line?.trim() || (bmModel ? bmModel.model_name || bmModel.id : bmId);
 
+      const hfValue = values.holdout_filter || 'all';
       const payload: BenchmarkRunRequest = {
         dataset_path: values.dataset_path,
         model_configs: modelConfigsPayload,
@@ -606,19 +613,21 @@ export const BenchmarkList: React.FC = () => {
         max_tokens: globalMaxTokens,
         ignore_sample_max_tokens: !!values.ignore_sample_max_tokens,
         allow_unlabeled: !!values.allow_unlabeled,
-        sampling_config: values.sampling_enabled
-          ? {
-              enabled: true,
-              pass_threshold_x: values.pass_threshold_x ?? 3,
-              interval_step_s: values.interval_step_s ?? 1,
-              max_interval_n: values.max_interval_n ?? 5,
-              min_pass_score: values.min_pass_score ? Number(values.min_pass_score) : null,
-              model_line: resolvedModelLine,
-              version_tag: values.version_tag?.trim() || null,
-              benchmark_model_id: bmId,
-              tracker_model_keys: bmId ? [bmId] : [],
-            }
-          : undefined,
+        sampling_config:
+          values.sampling_enabled || hfValue !== 'all'
+            ? {
+                enabled: !!values.sampling_enabled,
+                pass_threshold_x: values.pass_threshold_x ?? 3,
+                interval_step_s: values.interval_step_s ?? 1,
+                max_interval_n: values.max_interval_n ?? 5,
+                min_pass_score: values.min_pass_score ? Number(values.min_pass_score) : null,
+                holdout_filter: hfValue,
+                model_line: values.sampling_enabled ? resolvedModelLine : null,
+                version_tag: values.sampling_enabled ? values.version_tag?.trim() || null : null,
+                benchmark_model_id: values.sampling_enabled ? bmId : null,
+                tracker_model_keys: values.sampling_enabled && bmId ? [bmId] : [],
+              }
+            : undefined,
       };
 
       const res = await benchmarksApi.run(payload);
@@ -800,6 +809,14 @@ export const BenchmarkList: React.FC = () => {
           <div className="space-y-1">
             {entries.map(([mName, s]: [string, any]) => {
               const rate = Math.round((s.pass_rate || 0) * 100);
+              const hRate =
+                s.holdout_pass_rate !== undefined && s.holdout_pass_rate !== null
+                  ? Math.round(s.holdout_pass_rate * 100)
+                  : null;
+              const rRate =
+                s.regular_pass_rate !== undefined && s.regular_pass_rate !== null
+                  ? Math.round(s.regular_pass_rate * 100)
+                  : null;
               const color =
                 rate >= 80
                   ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
@@ -809,25 +826,33 @@ export const BenchmarkList: React.FC = () => {
               return (
                 <div
                   key={mName}
-                  className={`text-3xs px-1.5 py-0.5 rounded border flex items-center justify-between ${color}`}
+                  className={`text-3xs px-1.5 py-0.5 rounded border flex flex-col gap-0.5 ${color}`}
                 >
-                  <span className="font-mono truncate max-w-[110px]" title={mName}>
-                    {mName}
-                  </span>
-                  <div className="flex items-center gap-1">
-                    <span className="font-bold">{rate}%</span>
-                    {s.estimated_full_pass_rate !== undefined &&
-                      s.estimated_full_pass_rate !== null &&
-                      s.is_benchmark_model !== false &&
-                      (record.skipped_mastered_samples ?? 0) > 0 && (
-                        <span
-                          className="text-3xs text-purple-700 bg-purple-50 px-1 rounded border border-purple-200"
-                          title={`全集等效通过率 (按实测熟题保持率折算): ${Math.round(s.estimated_full_pass_rate * 100)}%`}
-                        >
-                          等效{Math.round(s.estimated_full_pass_rate * 100)}%
-                        </span>
-                      )}
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono truncate max-w-[110px]" title={mName}>
+                      {mName}
+                    </span>
+                    <div className="flex items-center gap-1">
+                      <span className="font-bold">{rate}%</span>
+                      {s.estimated_full_pass_rate !== undefined &&
+                        s.estimated_full_pass_rate !== null &&
+                        s.is_benchmark_model !== false &&
+                        (record.skipped_mastered_samples ?? 0) > 0 && (
+                          <span
+                            className="text-3xs text-purple-700 bg-purple-50 px-1 rounded border border-purple-200"
+                            title={`全集等效通过率 (按实测熟题保持率折算): ${Math.round(s.estimated_full_pass_rate * 100)}%`}
+                          >
+                            等效{Math.round(s.estimated_full_pass_rate * 100)}%
+                          </span>
+                        )}
+                    </div>
                   </div>
+                  {(hRate !== null || rRate !== null) && (
+                    <div className="text-4xs text-slate-500 font-mono flex items-center justify-between border-t border-black/5 pt-0.5">
+                      <span>留出: {hRate !== null ? `${hRate}%` : '—'}</span>
+                      <span>普通: {rRate !== null ? `${rRate}%` : '—'}</span>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -1160,14 +1185,31 @@ export const BenchmarkList: React.FC = () => {
               <div>
                 <div className="flex items-center gap-1.5 font-semibold text-slate-800 text-xs">
                   <FilterOutlined className="text-purple-600" />
-                  <span>2. 测评集抽取与动态降频策略</span>
+                  <span>2. 测评集题型过滤与动态降频策略</span>
                 </div>
                 <span className="text-3xs text-slate-500 block mt-0.5">
-                  错题/新题 100% 必测；熟题阶梯拉长复测间隔，按最大 N 次封顶轮巡，大幅节省模型推理算力。
+                  留出题与普通题均支持学会降频、遗忘唤醒与评测过滤；评测报告将自动按留出题与普通题区分统计通过率。
                 </span>
               </div>
               <Form.Item name="sampling_enabled" valuePropName="checked" className="m-0">
                 <Switch checkedChildren="智能阶梯降频开启" unCheckedChildren="全量评测 (100%)" />
+              </Form.Item>
+            </div>
+
+            <div className="pt-2 border-t border-purple-200/80">
+              <Form.Item
+                name="holdout_filter"
+                label={<span className="text-3xs font-semibold text-slate-700">评测题型范围过滤</span>}
+                className="m-0"
+              >
+                <Select
+                  size="small"
+                  options={[
+                    { value: 'all', label: '全部题目参评（同时评测留出题与普通题，报告分别统计通过率）' },
+                    { value: 'holdout_only', label: '🔒 仅评测留出题 (is_holdout=true)' },
+                    { value: 'non_holdout_only', label: '📄 仅评测普通题 (is_holdout=false)' },
+                  ]}
+                />
               </Form.Item>
             </div>
 
@@ -1261,88 +1303,89 @@ export const BenchmarkList: React.FC = () => {
                     className="text-3xs py-1 px-2.5"
                     message={
                       <span>
-                        💡 <strong>独立流水账本</strong>：战绩保存在平台流水表（原始 .jsonl 保持纯净只读）。同模型线同版本号重跑将自动复用首次题单且不推进轮空计数；仅当题目标记为留出题 (<code className="font-mono">is_holdout=true</code>) 时才允许降频。
+                        💡 <strong>独立流水账本</strong>：战绩保存在平台流水表（原始 .jsonl 保持纯净只读）。同模型线同版本号重跑将自动复用首次题单且不推进轮空计数；无论是留出题 (<code className="font-mono">is_holdout=true</code>) 还是普通题 (<code className="font-mono">is_holdout=false</code>)，均支持连续达标学会降频与复测失败遗忘唤醒。
                       </span>
                     }
                   />
                 </div>
+              </div>
+            )}
 
-                {/* 实时算力与抽样预览看板 */}
-                <div className="p-2.5 bg-purple-50/80 rounded border border-purple-200">
-                  <div className="flex items-center justify-between mb-1.5">
-                    <span className="text-3xs font-bold text-purple-900 flex items-center gap-1">
-                      <ExperimentOutlined /> 本次预计抽样与算力节省试算
-                    </span>
-                    <Space size="small">
-                      <Button
-                        size="small"
-                        type="text"
-                        icon={<ReloadOutlined spin={previewLoading} />}
-                        onClick={refreshSamplingPreview}
-                        className="text-3xs text-purple-700 h-6 px-1.5"
-                      >
-                        刷新试算
+            {(watchedSamplingEnabled || watchedHoldoutFilter !== 'all') && (
+              <div className="p-2.5 bg-purple-50/80 rounded border border-purple-200">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-3xs font-bold text-purple-900 flex items-center gap-1">
+                    <ExperimentOutlined /> 本次预计评测样本分布与算力节省试算
+                  </span>
+                  <Space size="small">
+                    <Button
+                      size="small"
+                      type="text"
+                      icon={<ReloadOutlined spin={previewLoading} />}
+                      onClick={refreshSamplingPreview}
+                      className="text-3xs text-purple-700 h-6 px-1.5"
+                    >
+                      刷新试算
+                    </Button>
+                    <Popconfirm
+                      title="确定重置该数据集在流水表中的复测战绩？"
+                      description="重置后将作废对应流水记录，所有题目将回归全新状态 (c=0) 必测。"
+                      onConfirm={handleResetDatasetTracker}
+                      okText="确认重置"
+                      cancelText="取消"
+                    >
+                      <Button size="small" danger type="link" className="text-3xs h-6 px-1">
+                        🔄 重置战绩归零
                       </Button>
-                      <Popconfirm
-                        title="确定重置该数据集在流水表中的复测战绩？"
-                        description="重置后将作废对应流水记录，所有题目将回归全新状态 (c=0) 必测。"
-                        onConfirm={handleResetDatasetTracker}
-                        okText="确认重置"
-                        cancelText="取消"
-                      >
-                        <Button size="small" danger type="link" className="text-3xs h-6 px-1">
-                          🔄 重置战绩归零
-                        </Button>
-                      </Popconfirm>
-                    </Space>
-                  </div>
-
-                  {samplingPreview ? (
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between text-xs font-semibold flex-wrap gap-1">
-                        <span>
-                          总题量: <span className="font-mono">{samplingPreview.total_samples}</span> 题 ➔ 本次实测:{' '}
-                          <span className="font-mono text-purple-700">{samplingPreview.sampled_samples}</span> 题
-                        </span>
-                        <div className="flex items-center gap-1">
-                          {samplingPreview.is_rerun_same_version && (
-                            <Tag color="cyan" className="m-0 font-semibold">
-                              📌 命中同版本快照复用
-                            </Tag>
-                          )}
-                          <Tag color="purple" className="m-0 font-bold">
-                            节省 {samplingPreview.saved_compute_ratio}% 算力
-                          </Tag>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-1.5 flex-wrap text-3xs font-mono">
-                        <Tag color="red" className="m-0">
-                          🔴 必测攻坚: {samplingPreview.active_pool_count} 题
-                        </Tag>
-                        <Tag color="gold" className="m-0">
-                          🟡 触顶必测: {samplingPreview.hard_cap_pool_count} 题
-                        </Tag>
-                        <Tag color="blue" className="m-0">
-                          🟢 降频轮巡: {samplingPreview.regular_cooldown_count} 题
-                        </Tag>
-                        <Tag color="default" className="m-0">
-                          💤 本轮休眠免测: {samplingPreview.skipped_samples} 题
-                        </Tag>
-                        <Tag color="geekblue" className="m-0">
-                          🏷️ 留出题: {samplingPreview.holdout_count ?? 0} / 同源题: {samplingPreview.non_holdout_count ?? 0}
-                        </Tag>
-                      </div>
-                      {samplingPreview.notice && (
-                        <div className="text-3xs text-purple-800">{samplingPreview.notice}</div>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="text-3xs text-purple-700">
-                      {previewLoading ? '正在试算题目分布...' : '请选择数据集以查看智能降频试算分布'}
-                    </div>
-                  )}
+                    </Popconfirm>
+                  </Space>
                 </div>
+
+                {samplingPreview ? (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-semibold flex-wrap gap-1">
+                      <span>
+                        范围题量: <span className="font-mono">{samplingPreview.total_samples}</span> 题 ➔ 本次实测:{' '}
+                        <span className="font-mono text-purple-700">{samplingPreview.sampled_samples}</span> 题
+                      </span>
+                      <div className="flex items-center gap-1">
+                        {samplingPreview.is_rerun_same_version && (
+                          <Tag color="cyan" className="m-0 font-semibold">
+                            📌 命中同版本快照复用
+                          </Tag>
+                        )}
+                        <Tag color="purple" className="m-0 font-bold">
+                          节省 {samplingPreview.saved_compute_ratio}% 算力
+                        </Tag>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 flex-wrap text-3xs font-mono">
+                      <Tag color="red" className="m-0">
+                        🔴 必测攻坚: {samplingPreview.active_pool_count} 题
+                      </Tag>
+                      <Tag color="gold" className="m-0">
+                        🟡 触顶必测: {samplingPreview.hard_cap_pool_count} 题
+                      </Tag>
+                      <Tag color="blue" className="m-0">
+                        🟢 降频轮巡: {samplingPreview.regular_cooldown_count} 题
+                      </Tag>
+                      <Tag color="default" className="m-0">
+                        💤 本轮休眠免测: {samplingPreview.skipped_samples} 题
+                      </Tag>
+                      <Tag color="geekblue" className="m-0">
+                        🏷️ 留出题: {samplingPreview.sampled_holdout_count ?? samplingPreview.holdout_count ?? 0}/{samplingPreview.holdout_count ?? 0} ｜ 普通题: {samplingPreview.sampled_non_holdout_count ?? samplingPreview.non_holdout_count ?? 0}/{samplingPreview.non_holdout_count ?? 0}
+                      </Tag>
+                    </div>
+                    {samplingPreview.notice && (
+                      <div className="text-3xs text-purple-800">{samplingPreview.notice}</div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-3xs text-purple-700">
+                    {previewLoading ? '正在试算题目分布...' : '请选择数据集以查看评测样本与降频试算分布'}
+                  </div>
+                )}
               </div>
             )}
           </div>

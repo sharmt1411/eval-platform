@@ -133,6 +133,8 @@ def _brief_benchmark_task(task: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(mv, dict):
                 models_brief[mk] = {
                     "pass_rate": mv.get("pass_rate"),
+                    "holdout_pass_rate": mv.get("holdout_pass_rate"),
+                    "regular_pass_rate": mv.get("regular_pass_rate"),
                     "passed_samples": mv.get("passed_samples"),
                     "total_samples": mv.get("total_samples"),
                     "api_error_samples": mv.get("api_error_samples"),
@@ -193,6 +195,13 @@ def task_status_cmd(ctx: click.Context, task_id: str) -> None:
 )
 @click.option("--category", default=None, help="按题目分类过滤")
 @click.option("--difficulty", default=None, help="按题目难度过滤")
+@click.option(
+    "--holdout-filter",
+    default="all",
+    show_default=True,
+    type=click.Choice(["all", "holdout_only", "non_holdout_only"], case_sensitive=False),
+    help="按题型属性过滤: all(全部) / holdout_only(仅留出题) / non_holdout_only(仅普通题)",
+)
 @click.option("--sample-id", default=None, help="精确查看单个 sample_id")
 @click.option("--offset", type=int, default=0, show_default=True, help="分页偏移")
 @click.option("--limit", type=int, default=None, help="最多返回样本条数")
@@ -205,6 +214,7 @@ def side_by_side_cmd(
     filter_type: str,
     category: Optional[str],
     difficulty: Optional[str],
+    holdout_filter: str,
     sample_id: Optional[str],
     offset: int,
     limit: Optional[int],
@@ -223,6 +233,7 @@ def side_by_side_cmd(
         filter_type=filter_type,
         category=category,
         difficulty=difficulty,
+        holdout_filter=holdout_filter,
         sample_id=sample_id,
         offset=offset,
         limit=limit,

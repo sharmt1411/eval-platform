@@ -25,71 +25,75 @@ from backend.app.engine.benchmark_runner import BenchmarkRunner
 
 
 def test_target_interval_and_holdout_constraint():
-    """测试单题目标复测间隔计算: 非留出题强制I=1、未达门槛I=1、阶梯递增与上限封顶"""
+    """测试单题目标复测间隔计算: 留出题与普通题均支持学会阶梯降频与遗忘唤醒 (与 is_holdout 解耦)"""
     t0 = SampleEvalTracker(consecutive_pass=0)
     assert BenchmarkSamplingEngine.compute_target_interval(t0, x=3, s=1, n=5, is_holdout=True) == 1
+    assert BenchmarkSamplingEngine.compute_target_interval(t0, x=3, s=1, n=5, is_holdout=False) == 1
 
     t2 = SampleEvalTracker(consecutive_pass=2)
     assert BenchmarkSamplingEngine.compute_target_interval(t2, x=3, s=1, n=5, is_holdout=True) == 1
+    assert BenchmarkSamplingEngine.compute_target_interval(t2, x=3, s=1, n=5, is_holdout=False) == 1
 
     t3 = SampleEvalTracker(consecutive_pass=3)
     assert BenchmarkSamplingEngine.compute_target_interval(t3, x=3, s=1, n=5, is_holdout=True) == 2
+    assert BenchmarkSamplingEngine.compute_target_interval(t3, x=3, s=1, n=5, is_holdout=False) == 2
 
     t4 = SampleEvalTracker(consecutive_pass=4)
     assert BenchmarkSamplingEngine.compute_target_interval(t4, x=3, s=1, n=5, is_holdout=True) == 3
+    assert BenchmarkSamplingEngine.compute_target_interval(t4, x=3, s=1, n=5, is_holdout=False) == 3
 
     t6 = SampleEvalTracker(consecutive_pass=6)
     assert BenchmarkSamplingEngine.compute_target_interval(t6, x=3, s=1, n=5, is_holdout=True) == 5
 
     t10 = SampleEvalTracker(consecutive_pass=10)
     assert BenchmarkSamplingEngine.compute_target_interval(t10, x=3, s=1, n=5, is_holdout=True) == 5
-
-    # 非留出题 (is_holdout=False) 即使连续通过10次也强制 I=1
-    assert BenchmarkSamplingEngine.compute_target_interval(t10, x=3, s=1, n=5, is_holdout=False) == 1
+    # 普通题 (is_holdout=False) 连续通过同样可以学会并降频，绝非每轮必出
+    assert BenchmarkSamplingEngine.compute_target_interval(t10, x=3, s=1, n=5, is_holdout=False) == 5
 
     # 被同组连坐唤醒 (force_due=True) 强制 I=1
     t_due = SampleEvalTracker(consecutive_pass=10, force_due=True)
     assert BenchmarkSamplingEngine.compute_target_interval(t_due, x=3, s=1, n=5, is_holdout=True) == 1
+    assert BenchmarkSamplingEngine.compute_target_interval(t_due, x=3, s=1, n=5, is_holdout=False) == 1
 
 
 def test_partition_samples_three_pools_and_steady_quota():
-    """测试三池分流、封顶保底与稳态配额精准收敛 (100题 I=5 -> 精准抽出20题)"""
+    """测试三池分流、封顶保底、留出与普通题均支持降频过滤及稳态配额精准收敛 (100题 I=5 -> 精准抽出20题)"""
     # 1. 混合池测试
     samples = []
-    # 3道攻坚题 (c=0)
+    # 3道攻坚题 (c=0, 含留出题与普通题)
     for i in range(1, 4):
         samples.append(
             BenchmarkSample(
                 id=f"q_active_{i}",
-                is_holdout=True,
+                is_holdout=(i != 3),
                 messages=[ChatMessage(role="user", content=f"攻坚问题 {i}")],
                 eval_tracker=SampleEvalTracker(consecutive_pass=0, miss_streak=0),
             )
         )
-    # 1道非留出题 (虽 c=5 但 is_holdout=False -> 必须进攻坚池)
+    # 1道普通题触顶熟题 (is_holdout=False, c=6, m=4 -> m+1=5 >= N=5，普通题同样进熟题池并支持触顶保底)
     samples.append(
         BenchmarkSample(
-            id="q_non_holdout",
+            id="q_non_holdout_hardcap",
             is_holdout=False,
-            messages=[ChatMessage(role="user", content="同源非留出题")],
-            eval_tracker=SampleEvalTracker(consecutive_pass=5, miss_streak=4),
+            messages=[ChatMessage(role="user", content="普通触顶熟题")],
+            eval_tracker=SampleEvalTracker(consecutive_pass=6, miss_streak=4),
         )
     )
-    # 1道触顶熟题 (is_holdout=True, c=6, m=4 -> m+1=5 >= N=5)
+    # 1道留出题触顶熟题 (is_holdout=True, c=6, m=4 -> m+1=5 >= N=5)
     samples.append(
         BenchmarkSample(
             id="q_hardcap_4",
             is_holdout=True,
-            messages=[ChatMessage(role="user", content="触顶熟题")],
+            messages=[ChatMessage(role="user", content="留出触顶熟题")],
             eval_tracker=SampleEvalTracker(consecutive_pass=6, miss_streak=4),
         )
     )
-    # 5道常规熟题 (is_holdout=True, c=3 -> I=2)
+    # 5道常规熟题 (含留出题与普通题, c=3 -> I=2，并非每轮必出)
     for i in range(5, 10):
         samples.append(
             BenchmarkSample(
                 id=f"q_cooldown_{i}",
-                is_holdout=True,
+                is_holdout=(i % 2 == 1),
                 messages=[ChatMessage(role="user", content=f"冷却熟题 {i}")],
                 eval_tracker=SampleEvalTracker(consecutive_pass=3, miss_streak=(i % 2)),
             )
@@ -104,18 +108,33 @@ def test_partition_samples_three_pools_and_steady_quota():
     assert len(selected) + len(skipped) == 10
     for i in range(1, 4):
         assert f"q_active_{i}" in selected_ids
-    assert "q_non_holdout" in selected_ids
+    assert "q_non_holdout_hardcap" in selected_ids
     assert "q_hardcap_4" in selected_ids
-    assert stats["active_pool_count"] == 4
-    assert stats["hard_cap_pool_count"] == 1
-    assert stats["holdout_count"] == 9
-    assert stats["non_holdout_count"] == 1
+    assert stats["active_pool_count"] == 3
+    assert stats["hard_cap_pool_count"] == 2
+    assert stats["cooldown_pool_total"] == 7
+    assert stats["holdout_count"] == 6
+    assert stats["non_holdout_count"] == 4
+    # 验证普通题 (is_holdout=False) 在常规熟题池中可以被正常休眠跳过 (不是每轮必出)
+    skipped_non_holdout = [s.id for s in skipped if not s.is_holdout]
+    assert len(skipped_non_holdout) >= 1
+
+    # 验证评测题型过滤 (holdout_filter)
+    cfg_holdout_only = SamplingFilterConfig(enabled=True, pass_threshold_x=3, holdout_filter="holdout_only")
+    sel_h, skp_h, st_h = BenchmarkSamplingEngine.partition_samples(samples, cfg_holdout_only)
+    assert st_h["total_samples"] == 6
+    assert all(s.is_holdout for s in sel_h + skp_h)
+
+    cfg_regular_only = SamplingFilterConfig(enabled=True, pass_threshold_x=3, holdout_filter="non_holdout_only")
+    sel_r, skp_r, st_r = BenchmarkSamplingEngine.partition_samples(samples, cfg_regular_only)
+    assert st_r["total_samples"] == 4
+    assert all(not s.is_holdout for s in sel_r + skp_r)
 
     # 2. 稳态配额精确度验证: 100道全熟题 I=5 -> 精确抽 20 题
     steady_samples = [
         BenchmarkSample(
             id=f"steady_{i}",
-            is_holdout=True,
+            is_holdout=(i % 2 == 0),
             messages=[ChatMessage(role="user", content=f"稳态题 {i}")],
             eval_tracker=SampleEvalTracker(consecutive_pass=6, miss_streak=(i % 4)),
         )
@@ -237,7 +256,7 @@ def test_ledger_aggregation_version_set_rerun_fingerprint_and_revoke():
         assert tr_after_v12["s1"].consecutive_pass == 3
         assert tr_after_v12["s1"].target_interval == 2
         assert tr_after_v12["s4"].consecutive_pass == 3
-        assert tr_after_v12["s4"].target_interval == 1  # 非留出题永远 I=1
+        assert tr_after_v12["s4"].target_interval == 2  # 普通题 (is_holdout=False) 同样可以学会进入降频池 I=2
 
         # 模型线 B 完全隔离不受 A 影响
         tr_line_b = BenchmarkSamplingEngine.aggregate_trackers_from_ledgers(
@@ -308,21 +327,24 @@ def test_ledger_aggregation_version_set_rerun_fingerprint_and_revoke():
 
 
 def test_estimated_full_pass_rate_r_cooldown_and_isolation():
-    """测试分层折算等效通过率: 按 R_cooldown 加权折算、陪跑模型不显示等效分、熟题全API异常置None"""
+    """测试分层折算等效通过率及评测报告按留出题 (Holdout) 与普通题 (Regular) 区分通过率"""
     runner = BenchmarkRunner()
+    # 6道留出题 (s_0..s_5, 其中 s_0 必败 -> 留出题实测通过率 5/6 = 0.8333)
+    # 4道普通题 (s_6..s_9, 其中 s_6, s_7 必败 -> 普通题实测通过率 2/4 = 0.5)
+    # 总实测通过 7/10 = 0.7
     samples = [
         BenchmarkSample(
             id=f"s_{i}",
-            is_holdout=True,
+            is_holdout=(i < 6),
             messages=[ChatMessage(role="user", content="test")],
-            regex_constraints=["MOCK_MUST_FAIL"] if i == 0 else [],
+            regex_constraints=["MOCK_MUST_FAIL"] if i in (0, 6, 7) else [],
         )
         for i in range(10)
     ]
-    # 假设前4道属于抽中复测的熟题 (s_0 必败, s_1..s_3 必过 -> R_cooldown = 3/4 = 0.75)
-    cooldown_ids = {"s_0", "s_1", "s_2", "s_3"}
-    # 全集 50 题, 跳过 40 题, 实测 10 题 (9 过, 1 败)
-    # 期望全集等效 = (9 + 40 * 0.75) / 50 = 39 / 50 = 0.78
+    # 假设 s_0, s_1, s_2 (留出) 与 s_8 (普通) 共 4 道属于抽中复测的熟题 (s_0 必败, 其余 3 道必过 -> R_cooldown = 3/4 = 0.75)
+    cooldown_ids = {"s_0", "s_1", "s_2", "s_8"}
+    # 全集 50 题, 跳过 40 题 (留出休眠 24 题, 普通休眠 16 题), 实测 10 题 (7 过, 3 败)
+    # 期望全集等效 = (7 + 40 * 0.75) / 50 = 37 / 50 = 0.74
     bm_cfg = ModelEvalConfig(model_id="bm_model", display_name="基准模型", provider_type="mock")
     comp_cfg = ModelEvalConfig(model_id="comp_model", display_name="陪跑模型", provider_type="mock")
 
@@ -341,20 +363,39 @@ def test_estimated_full_pass_rate_r_cooldown_and_isolation():
         skipped_mastered_samples=40,
         sampling_config=sampling_cfg,
         cooldown_sample_ids=cooldown_ids,
+        skipped_holdout_samples=24,
+        skipped_regular_samples=16,
     )
 
     bm_sum = matrix["summaries"]["基准模型"]
     comp_sum = matrix["summaries"]["陪跑模型"]
 
     assert bm_sum["is_benchmark_model"] is True
+    assert bm_sum["pass_rate"] == 0.7
     assert bm_sum["cooldown_tested_samples"] == 4
     assert bm_sum["cooldown_passed_samples"] == 3
     assert bm_sum["cooldown_failed_samples"] == 1
     assert bm_sum["cooldown_retention_rate"] == 0.75
-    assert bm_sum["estimated_full_pass_rate"] == 0.78
+    assert bm_sum["estimated_full_pass_rate"] == 0.74
 
-    # 陪跑模型不计算虚高全集等效分
+    # 验证评测报告按留出题与普通题区分通过率
+    assert bm_sum["holdout_total_samples"] == 6
+    assert bm_sum["holdout_passed_samples"] == 5
+    assert bm_sum["holdout_failed_samples"] == 1
+    assert bm_sum["holdout_pass_rate"] == 0.8333
+    assert bm_sum["regular_total_samples"] == 4
+    assert bm_sum["regular_passed_samples"] == 2
+    assert bm_sum["regular_failed_samples"] == 2
+    assert bm_sum["regular_pass_rate"] == 0.5
+    assert bm_sum["holdout_breakdown"]["holdout"]["pass_rate"] == 0.8333
+    assert bm_sum["holdout_breakdown"]["regular"]["pass_rate"] == 0.5
+    assert matrix["side_by_side"]["s_0"]["is_holdout"] is True
+    assert matrix["side_by_side"]["s_6"]["is_holdout"] is False
+
+    # 陪跑模型同样区分展示留出与普通实测通过率，但不计算虚高全集等效分
     assert comp_sum["is_benchmark_model"] is False
+    assert comp_sum["holdout_pass_rate"] == 0.8333
+    assert comp_sum["regular_pass_rate"] == 0.5
     assert comp_sum["estimated_full_pass_rate"] is None
 
 

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-常规评测集动态阶梯降频抽取与复测战绩治理引擎 (Benchmark Sampling Engine v2.1)
+常规评测集动态阶梯降频抽取与复测战绩治理引擎 (Benchmark Sampling Engine v2.2)
 核心功能:
 1. 数据集 (.jsonl) 保持 100% 纯净只读，战绩流水按 (dataset_path, model_line) 独立存储于 SQLite benchmark_run_ledgers;
-2. 留出题 (is_holdout=True) 资格校验: 非留出题强制 I=1，杜绝训练集背诵污染降频;
+2. 学会与遗忘与题型 (is_holdout) 解耦: 无论留出题 (is_holdout=True) 还是普通题 (is_holdout=False)，均支持连续达标学会降频、复测失败遗忘归零及评测过滤;
 3. 按 passed_versions 不重复版本集合计数，支持同 (dataset, model_line, version_tag) 题单快照复用，防止 A/B 版本交替刷分;
 4. 单题内容指纹 (content_hash) 变更检测: 仅当题目自身内容修改时重置该题战绩，追加新题不误伤存量熟题;
 5. 三池分流 + 紧迫度配额平滑 + 可选显式 group_key 连坐唤醒;
@@ -93,11 +93,11 @@ class BenchmarkSamplingEngine:
         is_holdout: bool = True,
     ) -> int:
         """
-        计算单道样本的目标复测间隔 I_i:
-        - 若非留出题 (is_holdout=False) 或被同组连坐唤醒 (force_due=True) 或 c < x: I_i = 1
-        - 若 is_holdout=True 且 c >= x: I_i = min(N, 1 + (c - x + 1) * s)
+        计算单道样本的目标复测间隔 I_i (与 is_holdout 解耦，留出题与普通题均支持学会降频与遗忘唤醒):
+        - 若被同组连坐唤醒 (force_due=True) 或 c < x: I_i = 1
+        - 若 c >= x: I_i = min(N, 1 + (c - x + 1) * s)
         """
-        if not is_holdout or tracker.force_due:
+        if tracker.force_due:
             return 1
         c = tracker.consecutive_pass
         if c < x:
@@ -296,9 +296,17 @@ class BenchmarkSamplingEngine:
         n = config.max_interval_n
         model_line = (config.model_line or "").strip() or None
         version_tag = (config.version_tag or "").strip() or None
+        holdout_filter = getattr(config, "holdout_filter", "all") or "all"
 
-        holdout_count = sum(1 for item in samples if item.is_holdout)
-        non_holdout_count = len(samples) - holdout_count
+        if holdout_filter == "holdout_only":
+            candidate_samples = [item for item in samples if item.is_holdout]
+        elif holdout_filter == "non_holdout_only":
+            candidate_samples = [item for item in samples if not item.is_holdout]
+        else:
+            candidate_samples = list(samples)
+
+        holdout_count = sum(1 for item in candidate_samples if item.is_holdout)
+        non_holdout_count = len(candidate_samples) - holdout_count
 
         # 解析当前各题战绩映射
         resolved_trackers: Dict[str, SampleEvalTracker] = {}
@@ -320,38 +328,48 @@ class BenchmarkSamplingEngine:
                 resolved_trackers[item.id] = cls.get_or_create_tracker(item)
 
         if not config.enabled:
-            for sample in samples:
+            for sample in candidate_samples:
                 tr = resolved_trackers.get(sample.id, SampleEvalTracker())
                 tr.target_interval = cls.compute_target_interval(
                     tr, x=x, s=s, n=n, is_holdout=sample.is_holdout
                 )
                 sample.eval_tracker = tr
 
+            filter_desc = (
+                "仅留出题" if holdout_filter == "holdout_only"
+                else "仅普通题" if holdout_filter == "non_holdout_only"
+                else "全量题目"
+            )
             stats = {
-                "total_samples": len(samples),
-                "sampled_samples": len(samples),
+                "total_samples": len(candidate_samples),
+                "sampled_samples": len(candidate_samples),
                 "skipped_samples": 0,
                 "saved_compute_ratio": 0.0,
-                "active_pool_count": len(samples),
+                "active_pool_count": len(candidate_samples),
                 "hard_cap_pool_count": 0,
                 "regular_cooldown_count": 0,
                 "cooldown_pool_total": 0,
                 "holdout_count": holdout_count,
                 "non_holdout_count": non_holdout_count,
+                "sampled_holdout_count": holdout_count,
+                "sampled_non_holdout_count": non_holdout_count,
+                "skipped_holdout_count": 0,
+                "skipped_non_holdout_count": 0,
+                "holdout_filter": holdout_filter,
                 "is_rerun_same_version": False,
                 "model_line": model_line,
                 "version_tag": version_tag,
                 "cooldown_sample_ids": [],
-                "notice": "当前为全量评测模式 (100% 样本参评)",
+                "notice": f"当前为{filter_desc}不降频模式 (100% 命中样本参评，留出题 {holdout_count} / 普通题 {non_holdout_count})",
             }
-            return list(samples), [], stats
+            return list(candidate_samples), [], stats
 
-        # 计算每题目标间隔并识别当前属于熟题池的样本
+        # 计算每题目标间隔并识别当前属于熟题池的样本 (留出题与普通题均支持学会进熟题池)
         pool_active: List[BenchmarkSample] = []
         pool_cooldown: List[BenchmarkSample] = []
         cooldown_pool_ids: Set[str] = set()
 
-        for sample in samples:
+        for sample in candidate_samples:
             tr = resolved_trackers.get(sample.id, SampleEvalTracker())
             target_interval = cls.compute_target_interval(
                 tr, x=x, s=s, n=n, is_holdout=sample.is_holdout
@@ -360,7 +378,7 @@ class BenchmarkSamplingEngine:
             resolved_trackers[sample.id] = tr
             sample.eval_tracker = tr
 
-            if sample.is_holdout and tr.consecutive_pass >= x:
+            if tr.consecutive_pass >= x:
                 cooldown_pool_ids.add(sample.id)
 
             if target_interval == 1:
@@ -378,7 +396,7 @@ class BenchmarkSamplingEngine:
             snap_set = set(snapshot_ids)
             selected_samples = []
             skipped_samples = []
-            for item in samples:
+            for item in candidate_samples:
                 if item.id in snap_set:
                     selected_samples.append(item)
                 elif item.id not in known_ids and item.eval_tracker and item.eval_tracker.target_interval == 1:
@@ -387,11 +405,15 @@ class BenchmarkSamplingEngine:
                 else:
                     skipped_samples.append(item)
 
-            total_count = len(samples)
+            total_count = len(candidate_samples)
             sampled_count = len(selected_samples)
             skipped_count = len(skipped_samples)
             saved_ratio = round((skipped_count / max(total_count, 1)) * 100.0, 1) if total_count > 0 else 0.0
             tested_cooldown_ids = [item.id for item in selected_samples if item.id in cooldown_pool_ids]
+            sampled_holdout_count = sum(1 for item in selected_samples if item.is_holdout)
+            sampled_non_holdout_count = sampled_count - sampled_holdout_count
+            skipped_holdout_count = sum(1 for item in skipped_samples if item.is_holdout)
+            skipped_non_holdout_count = skipped_count - skipped_holdout_count
 
             stats = {
                 "total_samples": total_count,
@@ -404,13 +426,19 @@ class BenchmarkSamplingEngine:
                 "cooldown_pool_total": len(cooldown_pool_ids),
                 "holdout_count": holdout_count,
                 "non_holdout_count": non_holdout_count,
+                "sampled_holdout_count": sampled_holdout_count,
+                "sampled_non_holdout_count": sampled_non_holdout_count,
+                "skipped_holdout_count": skipped_holdout_count,
+                "skipped_non_holdout_count": skipped_non_holdout_count,
+                "holdout_filter": holdout_filter,
                 "is_rerun_same_version": True,
                 "model_line": model_line,
                 "version_tag": version_tag,
                 "cooldown_sample_ids": tested_cooldown_ids,
                 "notice": (
                     f"命中同版本 [{model_line} / {version_tag}] 题单快照复用: "
-                    f"严格沿用首次抽出的 {sampled_count} 题，休眠 {skipped_count} 题（本轮不推进轮空计数 m）。"
+                    f"严格沿用首次抽出的 {sampled_count} 题（留出题 {sampled_holdout_count} / 普通题 {sampled_non_holdout_count}），"
+                    f"休眠 {skipped_count} 题（本轮不推进轮空计数 m）。"
                 ),
             }
             return selected_samples, skipped_samples, stats
@@ -453,17 +481,21 @@ class BenchmarkSamplingEngine:
         selected_samples: List[BenchmarkSample] = []
         skipped_samples: List[BenchmarkSample] = []
 
-        for sample in samples:
+        for sample in candidate_samples:
             if sample.id in selected_ids:
                 selected_samples.append(sample)
             else:
                 skipped_samples.append(sample)
 
-        total_count = len(samples)
+        total_count = len(candidate_samples)
         sampled_count = len(selected_samples)
         skipped_count = len(skipped_samples)
         saved_ratio = round((skipped_count / max(total_count, 1)) * 100.0, 1) if total_count > 0 else 0.0
         tested_cooldown_ids = [item.id for item in selected_samples if item.id in cooldown_pool_ids]
+        sampled_holdout_count = sum(1 for item in selected_samples if item.is_holdout)
+        sampled_non_holdout_count = sampled_count - sampled_holdout_count
+        skipped_holdout_count = sum(1 for item in skipped_samples if item.is_holdout)
+        skipped_non_holdout_count = skipped_count - skipped_holdout_count
 
         stats = {
             "total_samples": total_count,
@@ -476,13 +508,18 @@ class BenchmarkSamplingEngine:
             "cooldown_pool_total": len(pool_cooldown),
             "holdout_count": holdout_count,
             "non_holdout_count": non_holdout_count,
+            "sampled_holdout_count": sampled_holdout_count,
+            "sampled_non_holdout_count": sampled_non_holdout_count,
+            "skipped_holdout_count": skipped_holdout_count,
+            "skipped_non_holdout_count": skipped_non_holdout_count,
+            "holdout_filter": holdout_filter,
             "is_rerun_same_version": False,
             "model_line": model_line,
             "version_tag": version_tag,
             "cooldown_sample_ids": tested_cooldown_ids,
             "notice": (
-                f"智能阶梯降频生效: 本次实测 {sampled_count} 题（留出题 {holdout_count} / 同源题 {non_holdout_count}），"
-                f"休眠熟题 {skipped_count} 题，预计节省 {saved_ratio}% 推理算力。"
+                f"智能阶梯降频生效: 本次实测 {sampled_count} 题（留出题 {sampled_holdout_count}/{holdout_count}，普通题 {sampled_non_holdout_count}/{non_holdout_count}），"
+                f"休眠熟题 {skipped_count} 题（留出 {skipped_holdout_count} / 普通 {skipped_non_holdout_count}），预计节省 {saved_ratio}% 推理算力。"
             ),
         }
 
@@ -595,6 +632,11 @@ class BenchmarkSamplingEngine:
         cat_set = {c.strip() for c in export_req.categories if c and c.strip()}
         diff_set = {d.strip().lower() for d in export_req.difficulties if d and d.strip()}
         kw = (export_req.keyword or "").strip().lower()
+        effective_hf = (
+            export_req.holdout_filter
+            if export_req.holdout_filter != "all"
+            else (getattr(export_req.sampling_config, "holdout_filter", "all") or "all")
+        )
 
         filtered: List[BenchmarkSample] = []
         for s in pool:
@@ -602,9 +644,9 @@ class BenchmarkSamplingEngine:
                 continue
             if diff_set and (s.difficulty or "").strip().lower() not in diff_set:
                 continue
-            if export_req.holdout_filter == "holdout_only" and not s.is_holdout:
+            if effective_hf == "holdout_only" and not s.is_holdout:
                 continue
-            if export_req.holdout_filter == "non_holdout_only" and s.is_holdout:
+            if effective_hf == "non_holdout_only" and s.is_holdout:
                 continue
             if kw:
                 haystack_parts = [

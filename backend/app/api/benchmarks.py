@@ -111,7 +111,10 @@ def _execute_benchmark_task(task_id: str, payload: BenchmarkRunRequest):
         cooldown_sample_ids = set()
         sampling_stats = {}
 
-        if payload.sampling_config and payload.sampling_config.enabled:
+        if payload.sampling_config and (
+            payload.sampling_config.enabled
+            or getattr(payload.sampling_config, "holdout_filter", "all") != "all"
+        ):
             selected_samples, skipped_samples, sampling_stats = BenchmarkSamplingEngine.partition_samples(
                 samples,
                 payload.sampling_config,
@@ -119,7 +122,11 @@ def _execute_benchmark_task(task_id: str, payload: BenchmarkRunRequest):
                 dataset_path=real_path,
             )
             samples_to_run = selected_samples
+            total_dataset_samples = sampling_stats.get("total_samples", len(samples_to_run) + len(skipped_samples))
             cooldown_sample_ids = set(sampling_stats.get("cooldown_sample_ids", []))
+
+        skipped_holdout_cnt = sum(1 for s in skipped_samples if s.is_holdout)
+        skipped_regular_cnt = len(skipped_samples) - skipped_holdout_cnt
 
         # 查询并构建模型配置
         model_configs: List[ModelEvalConfig] = []
@@ -268,6 +275,8 @@ def _execute_benchmark_task(task_id: str, payload: BenchmarkRunRequest):
             skipped_mastered_samples=len(skipped_samples),
             sampling_config=payload.sampling_config,
             cooldown_sample_ids=cooldown_sample_ids,
+            skipped_holdout_samples=skipped_holdout_cnt,
+            skipped_regular_samples=skipped_regular_cnt,
         )
 
         # 战绩流水入账 (写入 SQLite benchmark_run_ledgers，保持 .jsonl 纯净只读)

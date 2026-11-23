@@ -224,6 +224,7 @@ class BenchmarkRunner:
                 sub_category=sample.sub_category,
                 difficulty=sample.difficulty,
                 source=sample.source,
+                is_holdout=bool(sample.is_holdout),
                 model_id=model_config.model_id,
                 response=resp,
                 objective_passed=False,
@@ -272,6 +273,7 @@ class BenchmarkRunner:
             sub_category=sample.sub_category,
             difficulty=sample.difficulty,
             source=sample.source,
+            is_holdout=bool(sample.is_holdout),
             model_id=model_config.model_id,
             response=resp,
             objective_passed=obj_res["passed"],
@@ -295,6 +297,8 @@ class BenchmarkRunner:
         cooldown_sample_ids: Optional[Set[str]] = None,
         is_benchmark_model: bool = True,
         min_pass_score: Optional[float] = None,
+        skipped_holdout_samples: int = 0,
+        skipped_regular_samples: int = 0,
     ) -> Dict[str, Any]:
         """对单一模型配置执行全量数据集并发评测并汇总指标"""
         adapter = AdapterFactory.create(
@@ -378,7 +382,7 @@ class BenchmarkRunner:
         effective_pass_rate = round(passed_obj / max(valid_count if valid_count > 0 else total, 1), 4)
         full_total = dataset_total_samples if dataset_total_samples is not None else total
 
-        # 熟题复测表现统计 (c_old >= x 且为留出题的有效样本)
+        # 熟题复测表现统计 (c_old >= x 的有效样本，包含留出题与普通题)
         cd_ids = cooldown_sample_ids or set()
         cd_valid_results = [r for r in valid_results if r.sample_id in cd_ids]
         cd_tested = len(cd_valid_results)
@@ -402,6 +406,66 @@ class BenchmarkRunner:
             else:
                 est_full_rate = effective_pass_rate
 
+        # 按留出题 (is_holdout=True) 与普通题 (is_holdout=False) 分别计算通过率与细分统计
+        def _build_holdout_group_metrics(
+            group_label: str,
+            group_results: List[SampleEvalResult],
+            group_skipped: int,
+        ) -> Dict[str, Any]:
+            g_tot = len(group_results)
+            g_ds_tot = g_tot + group_skipped
+            g_err = sum(1 for r in group_results if r.status == "API_ERROR")
+            g_val = g_tot - g_err
+            g_pass = sum(1 for r in group_results if r.status == "PASS")
+            g_fail = sum(1 for r in group_results if r.status == "FAIL")
+            g_rate: Optional[float] = round(g_pass / g_val, 4) if g_val > 0 else None
+            g_j = [r.judge_score for r in group_results if r.status != "API_ERROR" and r.judge_score is not None]
+            g_avg_j: Optional[float] = round(sum(g_j) / len(g_j), 2) if g_j else None
+
+            g_cd_valid = [r for r in group_results if r.status != "API_ERROR" and r.sample_id in cd_ids]
+            g_cd_tested = len(g_cd_valid)
+            g_cd_passed = sum(
+                1
+                for r in g_cd_valid
+                if r.status == "PASS" and (min_pass_score is None or r.judge_score is None or r.judge_score >= min_pass_score)
+            )
+            g_cd_failed = g_cd_tested - g_cd_passed
+            g_cd_ret: Optional[float] = round(g_cd_passed / g_cd_tested, 4) if g_cd_tested > 0 else None
+
+            g_est_full: Optional[float] = None
+            if is_benchmark_model and g_ds_tot > 0:
+                if group_skipped > 0:
+                    eff_ret = g_cd_ret if g_cd_ret is not None else cd_retention
+                    if eff_ret is not None:
+                        eff_denom = max(g_ds_tot - g_err, 1)
+                        g_est_full = round((g_pass + group_skipped * eff_ret) / eff_denom, 4)
+                else:
+                    g_est_full = g_rate
+
+            return {
+                "label": group_label,
+                "count": g_tot,
+                "total": g_tot,
+                "dataset_total": g_ds_tot,
+                "skipped": group_skipped,
+                "valid_count": g_val,
+                "api_error_count": g_err,
+                "passed": g_pass,
+                "failed": g_fail,
+                "pass_rate": g_rate,
+                "estimated_full_pass_rate": g_est_full,
+                "avg_judge_score": g_avg_j,
+                "cooldown_tested": g_cd_tested,
+                "cooldown_passed": g_cd_passed,
+                "cooldown_failed": g_cd_failed,
+                "cooldown_retention_rate": g_cd_ret,
+            }
+
+        holdout_results = [r for r in results if r.is_holdout]
+        regular_results = [r for r in results if not r.is_holdout]
+        holdout_info = _build_holdout_group_metrics("留出题 (Holdout)", holdout_results, skipped_holdout_samples)
+        regular_info = _build_holdout_group_metrics("普通题 (Regular)", regular_results, skipped_regular_samples)
+
         summary = BenchmarkSummary(
             model_id=model_config.model_id,
             total_samples=total,
@@ -418,6 +482,27 @@ class BenchmarkRunner:
             cooldown_passed_samples=cd_passed,
             cooldown_failed_samples=cd_failed,
             cooldown_retention_rate=cd_retention,
+            holdout_total_samples=holdout_info["total"],
+            holdout_dataset_total_samples=holdout_info["dataset_total"],
+            holdout_skipped_samples=holdout_info["skipped"],
+            holdout_valid_samples=holdout_info["valid_count"],
+            holdout_passed_samples=holdout_info["passed"],
+            holdout_failed_samples=holdout_info["failed"],
+            holdout_api_error_samples=holdout_info["api_error_count"],
+            holdout_pass_rate=holdout_info["pass_rate"],
+            holdout_estimated_full_pass_rate=holdout_info["estimated_full_pass_rate"],
+            holdout_avg_judge_score=holdout_info["avg_judge_score"],
+            regular_total_samples=regular_info["total"],
+            regular_dataset_total_samples=regular_info["dataset_total"],
+            regular_skipped_samples=regular_info["skipped"],
+            regular_valid_samples=regular_info["valid_count"],
+            regular_passed_samples=regular_info["passed"],
+            regular_failed_samples=regular_info["failed"],
+            regular_api_error_samples=regular_info["api_error_count"],
+            regular_pass_rate=regular_info["pass_rate"],
+            regular_estimated_full_pass_rate=regular_info["estimated_full_pass_rate"],
+            regular_avg_judge_score=regular_info["avg_judge_score"],
+            holdout_breakdown={"holdout": holdout_info, "regular": regular_info},
             is_benchmark_model=is_benchmark_model,
             avg_latency_ms=round(avg_latency, 2),
             avg_ttft_ms=round(avg_ttft, 2),
@@ -442,6 +527,8 @@ class BenchmarkRunner:
         skipped_mastered_samples: int = 0,
         sampling_config: Optional[SamplingFilterConfig] = None,
         cooldown_sample_ids: Optional[Set[str]] = None,
+        skipped_holdout_samples: int = 0,
+        skipped_regular_samples: int = 0,
     ) -> Dict[str, Any]:
         """评测矩阵: 1 个数据集 × N 组模型与配置"""
         from backend.app.engine.benchmark_sampler import BenchmarkSamplingEngine
@@ -452,6 +539,8 @@ class BenchmarkRunner:
             else set()
         )
         min_pass_score = sampling_config.min_pass_score if sampling_config else None
+        sampled_holdout_cnt = sum(1 for s in samples if s.is_holdout)
+        sampled_regular_cnt = len(samples) - sampled_holdout_cnt
 
         matrix_result: Dict[str, Any] = {
             "meta": {
@@ -459,6 +548,10 @@ class BenchmarkRunner:
                 "dataset_total_samples": dataset_total_samples or len(samples),
                 "sampled_samples": len(samples),
                 "skipped_mastered_samples": skipped_mastered_samples,
+                "sampled_holdout_samples": sampled_holdout_cnt,
+                "sampled_regular_samples": sampled_regular_cnt,
+                "skipped_holdout_samples": skipped_holdout_samples,
+                "skipped_regular_samples": skipped_regular_samples,
                 "sampling_config": sampling_config.model_dump() if sampling_config else None,
             },
             "summaries": {},
@@ -475,6 +568,7 @@ class BenchmarkRunner:
                 "sub_category": s.sub_category,
                 "difficulty": s.difficulty,
                 "source": s.source,
+                "is_holdout": bool(s.is_holdout),
                 "max_new_tokens": s.max_new_tokens,
                 "messages": msg_dicts,
                 "input_prompt": msg_dicts,
@@ -530,6 +624,8 @@ class BenchmarkRunner:
                 cooldown_sample_ids=cooldown_sample_ids,
                 is_benchmark_model=is_bm_model,
                 min_pass_score=min_pass_score,
+                skipped_holdout_samples=skipped_holdout_samples,
+                skipped_regular_samples=skipped_regular_samples,
             )
             summary: BenchmarkSummary = model_out["summary"]
             # 保证 summary 里的 model_id 和矩阵字典 key 保持一致，便于前端图表与卡片索引

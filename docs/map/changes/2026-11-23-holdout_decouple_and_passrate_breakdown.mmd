@@ -1,0 +1,21 @@
+%% title: 题型Holdout与学会遗忘降频解耦及报告留出/普通分层通过率变更图
+flowchart TB
+  benchmark["常规评测中心\nfrontend/src/pages/BenchmarkList.tsx\n题型过滤与分层通过率"]:::changed
+  benchmark_report["评测深度对比报告\nfrontend/src/pages/BenchmarkReport.tsx\n留出与普通分层通过率"]:::changed
+  dataset_center["数据集中心\nfrontend/src/pages/DatasetCenter.tsx\n留出与普通题过滤导出"]:::changed
+  api_benchmarks["常规评测路由\nbackend/app/api/benchmarks.py\n支持题型过滤与休眠拆分"]:::changed
+  benchmark_sampler["抽样与账本引擎\nbackend/app/engine/benchmark_sampler.py:BenchmarkSamplingEngine\n解耦Holdout与学会遗忘"]:::changed
+  benchmark_runner["评测矩阵执行器\nbackend/app/engine/benchmark_runner.py:BenchmarkRunner\n按留出和普通区分通过率"]:::changed
+  cli_benchmarks["评测 CLI 命令\ncli/commands/benchmarks.py\n支持题型过滤与分层摘要"]:::changed
+  sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\nTaskRecord/BenchmarkRunLedger")]
+  runs_dir[("本地评测数据与报告\ndata/runs\n含data/datasets题库只读")]
+
+  benchmark -->|"题型过滤/抽样试算/发起评测"| api_benchmarks
+  benchmark_report -->|"查询留出与普通分层报告"| api_benchmarks
+  dataset_center -->|"全题型学会/遗忘池过滤"| benchmark_sampler
+  cli_benchmarks -->|"按留出/普通过滤对比明细"| api_benchmarks
+  api_benchmarks -->|"全题型三池分流与题型过滤"| benchmark_sampler
+  api_benchmarks -->|"执行评测并传入休眠拆分"| benchmark_runner
+  benchmark_runner -->|"记录样本结果与题型标记"| benchmark_sampler
+  benchmark_sampler -->|"读写BenchmarkRunLedger"| sqlite_db
+  api_benchmarks -->|"落盘含分层通过率的报告"| runs_dir

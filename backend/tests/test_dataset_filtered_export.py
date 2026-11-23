@@ -106,7 +106,7 @@ def test_filter_samples_for_export_scopes_and_attributes():
     # 6 道题:
     # q1, q2, q3, q4: holdout=True, 连续通过 2 个版本 (v1, v2) -> c=2 >= x=2 -> I_i=2 (熟题池)
     # q5: holdout=True, v1 PASS, v2 FAIL -> c=0, last_status="FAIL" (必测攻坚池 + 失败池)
-    # q6: holdout=False, 连续通过 2 个版本 -> 因非留出强制 I_i=1 (必测攻坚池)
+    # q6: holdout=False, 连续通过 2 个版本 -> 普通题同样可以学会 c=2 >= x=2 -> I_i=2 (熟题池)
     samples = [
         _make_sample("q1", category="常识", difficulty="easy", is_holdout=True, content="网络 HTTP"),
         _make_sample("q2", category="常识", difficulty="medium", is_holdout=True, content="数学推理"),
@@ -142,7 +142,7 @@ def test_filter_samples_for_export_scopes_and_attributes():
             model_line=model_line,
         )
 
-        # 1. sampled: q5 + q6 (active=2) + round(4 * 0.5) = 2 from cooldown -> 共 4 题
+        # 1. sampled: q5 (active=1) + round(5 * 0.5) = 2 from cooldown -> 共 3 题
         sampled, stats = BenchmarkSamplingEngine.filter_samples_for_export(
             samples=samples,
             export_req=BenchmarkExportFilterRequest(sampling_config=base_sampling, export_scope="sampled"),
@@ -150,12 +150,12 @@ def test_filter_samples_for_export_scopes_and_attributes():
             dataset_path=ds_path,
         )
         sampled_ids = {s.id for s in sampled}
-        assert len(sampled) == 4
-        assert {"q5", "q6"}.issubset(sampled_ids)
-        assert stats["active_pool_count"] == 2
-        assert stats["skipped_samples"] == 2
+        assert len(sampled) == 3
+        assert "q5" in sampled_ids
+        assert stats["active_pool_count"] == 1
+        assert stats["skipped_samples"] == 3
 
-        # 2. skipped: 剩余 2 道熟题
+        # 2. skipped: 剩余 3 道熟题
         skipped, _ = BenchmarkSamplingEngine.filter_samples_for_export(
             samples=samples,
             export_req=BenchmarkExportFilterRequest(sampling_config=base_sampling, export_scope="skipped"),
@@ -163,27 +163,40 @@ def test_filter_samples_for_export_scopes_and_attributes():
             dataset_path=ds_path,
         )
         skipped_ids = {s.id for s in skipped}
-        assert len(skipped) == 2
+        assert len(skipped) == 3
         assert skipped_ids.isdisjoint(sampled_ids)
         assert sampled_ids | skipped_ids == {"q1", "q2", "q3", "q4", "q5", "q6"}
 
-        # 3. active_only: 仅 q5 和 q6
+        # 3. active_only: 仅 q5 (因为普通题 q6 也学会进入了熟题池!)
         active_only, _ = BenchmarkSamplingEngine.filter_samples_for_export(
             samples=samples,
             export_req=BenchmarkExportFilterRequest(sampling_config=base_sampling, export_scope="active_only"),
             db=db,
             dataset_path=ds_path,
         )
-        assert {s.id for s in active_only} == {"q5", "q6"}
+        assert {s.id for s in active_only} == {"q5"}
 
-        # 4. cooldown_all: q1, q2, q3, q4
+        # 4. cooldown_all: q1, q2, q3, q4, q6 (留出熟题与普通熟题均在熟题池)
         cooldown_all, _ = BenchmarkSamplingEngine.filter_samples_for_export(
             samples=samples,
             export_req=BenchmarkExportFilterRequest(sampling_config=base_sampling, export_scope="cooldown_all"),
             db=db,
             dataset_path=ds_path,
         )
-        assert {s.id for s in cooldown_all} == {"q1", "q2", "q3", "q4"}
+        assert {s.id for s in cooldown_all} == {"q1", "q2", "q3", "q4", "q6"}
+
+        # 4b. cooldown_all + non_holdout_only: 普通熟题 q6 支持按熟题池过滤导出
+        cooldown_regular, _ = BenchmarkSamplingEngine.filter_samples_for_export(
+            samples=samples,
+            export_req=BenchmarkExportFilterRequest(
+                sampling_config=base_sampling,
+                export_scope="cooldown_all",
+                holdout_filter="non_holdout_only",
+            ),
+            db=db,
+            dataset_path=ds_path,
+        )
+        assert [s.id for s in cooldown_regular] == ["q6"]
 
         # 5. failed_only (即使 sampling_config.enabled=False 也能根据 model_line 精准找出 FAIL 题)
         disabled_sampling = base_sampling.model_copy(update={"enabled": False})

@@ -30,6 +30,9 @@ class SamplingFilterConfig(BaseModel):
     min_pass_score: Optional[float] = Field(
         None, ge=0.0, le=100.0, description="计入连续通过的最低裁判分数线 (None表示默认按PASS及格线)"
     )
+    holdout_filter: Literal["all", "holdout_only", "non_holdout_only"] = Field(
+        "all", description="评测题型过滤: all(全部题目) / holdout_only(仅留出题) / non_holdout_only(仅普通题)"
+    )
     model_line: Optional[str] = Field(
         None, description="基准模型线标识 (例如 qwen2.5-7b-postloan；为空且未指定基准模型时表示只读摸底不入账)"
     )
@@ -50,7 +53,7 @@ class SamplingFilterConfig(BaseModel):
 
 class SamplingPreviewResponse(BaseModel):
     """抽样试算与预览响应"""
-    total_samples: int = Field(0, description="数据集原始总题数")
+    total_samples: int = Field(0, description="当前题型过滤范围内总题数")
     sampled_samples: int = Field(0, description="本次预计抽测题数")
     skipped_samples: int = Field(0, description="本次休眠免测熟题数")
     saved_compute_ratio: float = Field(0.0, description="预计节省算力百分比 (0~100)")
@@ -58,8 +61,13 @@ class SamplingPreviewResponse(BaseModel):
     hard_cap_pool_count: int = Field(0, description="封顶到期必测题数 (m + 1 >= N)")
     regular_cooldown_count: int = Field(0, description="常规降频轮巡抽中题数")
     cooldown_pool_total: int = Field(0, description="降频总池容量")
-    holdout_count: int = Field(0, description="纯评测留出题数量 (is_holdout=True)")
-    non_holdout_count: int = Field(0, description="非留出题数量 (is_holdout=False, 强制I=1)")
+    holdout_count: int = Field(0, description="留出题总数量 (is_holdout=True)")
+    non_holdout_count: int = Field(0, description="普通题总数量 (is_holdout=False)")
+    sampled_holdout_count: int = Field(0, description="本次实测留出题数量")
+    sampled_non_holdout_count: int = Field(0, description="本次实测普通题数量")
+    skipped_holdout_count: int = Field(0, description="本次休眠留出熟题数量")
+    skipped_non_holdout_count: int = Field(0, description="本次休眠普通熟题数量")
+    holdout_filter: Literal["all", "holdout_only", "non_holdout_only"] = "all"
     is_rerun_same_version: bool = Field(False, description="是否命中同模型线同版本题单快照复用")
     model_line: Optional[str] = None
     version_tag: Optional[str] = None
@@ -148,7 +156,7 @@ class BenchmarkSample(BaseModel):
     difficulty: Optional[str] = None
     source: Optional[str] = None
     max_new_tokens: Optional[int] = None
-    is_holdout: bool = Field(False, description="是否为纯评测留出题 (未进训练集，允许降频)")
+    is_holdout: bool = Field(False, description="是否为留出评测题 (True=留出题, False=普通题)")
     group_key: Optional[str] = Field(None, description="可选显式业务分组键 (如节点ID/FAQ编号)")
     messages: List[ChatMessage]
     reference: Optional[str] = None
@@ -176,7 +184,7 @@ class BenchmarkRunRequest(BaseModel):
     max_tokens: Optional[int] = Field(None, description="统一最大生成Token，若指定将应用为各模型的默认上限")
     ignore_sample_max_tokens: bool = Field(False, description="是否忽略样本自带的max_new_tokens限制")
     sampling_config: Optional[SamplingFilterConfig] = Field(
-        None, description="智能阶梯降频抽样配置，None 或 enabled=False 时为全量评测"
+        None, description="智能阶梯降频抽样与评测题型过滤配置，None 时为全量评测"
     )
     allow_unlabeled: bool = Field(
         False,
@@ -190,6 +198,7 @@ class SampleEvalResult(BaseModel):
     sub_category: Optional[str] = None
     difficulty: Optional[str] = None
     source: Optional[str] = None
+    is_holdout: bool = False
     model_id: str
     source_model_id: Optional[str] = None
     response: UnifiedChatResponse
@@ -218,6 +227,29 @@ class BenchmarkSummary(BaseModel):
     cooldown_passed_samples: int = 0
     cooldown_failed_samples: int = 0
     cooldown_retention_rate: Optional[float] = None
+    # 留出题 (is_holdout=True) 独立通过率与统计
+    holdout_total_samples: int = 0
+    holdout_dataset_total_samples: int = 0
+    holdout_skipped_samples: int = 0
+    holdout_valid_samples: int = 0
+    holdout_passed_samples: int = 0
+    holdout_failed_samples: int = 0
+    holdout_api_error_samples: int = 0
+    holdout_pass_rate: Optional[float] = None
+    holdout_estimated_full_pass_rate: Optional[float] = None
+    holdout_avg_judge_score: Optional[float] = None
+    # 普通题 (is_holdout=False) 独立通过率与统计
+    regular_total_samples: int = 0
+    regular_dataset_total_samples: int = 0
+    regular_skipped_samples: int = 0
+    regular_valid_samples: int = 0
+    regular_passed_samples: int = 0
+    regular_failed_samples: int = 0
+    regular_api_error_samples: int = 0
+    regular_pass_rate: Optional[float] = None
+    regular_estimated_full_pass_rate: Optional[float] = None
+    regular_avg_judge_score: Optional[float] = None
+    holdout_breakdown: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     is_benchmark_model: bool = False
     avg_latency_ms: float = 0.0
     avg_ttft_ms: float = 0.0

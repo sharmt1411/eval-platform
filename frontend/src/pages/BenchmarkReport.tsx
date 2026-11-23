@@ -60,6 +60,7 @@ export const BenchmarkReport: React.FC = () => {
   const [filterStatus, setFilterStatus] = useState<string>('ALL');
   const [filterCategory, setFilterCategory] = useState<string>('ALL');
   const [filterDifficulty, setFilterDifficulty] = useState<string>('ALL');
+  const [filterHoldout, setFilterHoldout] = useState<'ALL' | 'HOLDOUT' | 'REGULAR'>('ALL');
   const [searchKeyword, setSearchKeyword] = useState<string>('');
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [pageSize, setPageSize] = useState<number>(10);
@@ -257,6 +258,8 @@ export const BenchmarkReport: React.FC = () => {
     let allFail = 0;
     let allPass = 0;
     let apiError = 0;
+    let holdout = 0;
+    let regular = 0;
 
     allSamples.forEach((s) => {
       const meta = getSampleEvaluationMeta(s);
@@ -264,10 +267,124 @@ export const BenchmarkReport: React.FC = () => {
       if (meta.type === 'ALL_FAIL') allFail++;
       if (meta.type === 'ALL_PASS') allPass++;
       if (meta.hasApiError) apiError++;
+      if (s.is_holdout) {
+        holdout++;
+      } else {
+        regular++;
+      }
     });
 
-    return { all, divergence, allFail, allPass, apiError };
+    return { all, divergence, allFail, allPass, apiError, holdout, regular };
   }, [allSamples]);
+
+  // 解析单个模型的留出题 (Holdout) 与普通题 (Regular) 分层通过率（兼容旧版任务从 sideBySide 动态回算）
+  const resolveModelHoldoutStats = (mId: string, summary: any) => {
+    const hasBackendFields =
+      summary?.holdout_total_samples !== undefined ||
+      summary?.regular_total_samples !== undefined ||
+      summary?.holdout_breakdown !== undefined;
+
+    if (hasBackendFields) {
+      const hb = summary?.holdout_breakdown?.holdout || {};
+      const rb = summary?.holdout_breakdown?.regular || {};
+      const hTotal = summary.holdout_total_samples ?? hb.total ?? 0;
+      const hValid = summary.holdout_valid_samples ?? hb.valid_count ?? 0;
+      const hPassed = summary.holdout_passed_samples ?? hb.passed ?? 0;
+      const hSkipped = summary.holdout_skipped_samples ?? hb.skipped ?? 0;
+      const hRate = summary.holdout_pass_rate !== undefined ? summary.holdout_pass_rate : hb.pass_rate ?? null;
+      const hEstFull =
+        summary.holdout_estimated_full_pass_rate !== undefined
+          ? summary.holdout_estimated_full_pass_rate
+          : hb.estimated_full_pass_rate ?? null;
+      const hJudge =
+        summary.holdout_avg_judge_score !== undefined ? summary.holdout_avg_judge_score : hb.avg_judge_score ?? null;
+
+      const rTotal = summary.regular_total_samples ?? rb.total ?? 0;
+      const rValid = summary.regular_valid_samples ?? rb.valid_count ?? 0;
+      const rPassed = summary.regular_passed_samples ?? rb.passed ?? 0;
+      const rSkipped = summary.regular_skipped_samples ?? rb.skipped ?? 0;
+      const rRate = summary.regular_pass_rate !== undefined ? summary.regular_pass_rate : rb.pass_rate ?? null;
+      const rEstFull =
+        summary.regular_estimated_full_pass_rate !== undefined
+          ? summary.regular_estimated_full_pass_rate
+          : rb.estimated_full_pass_rate ?? null;
+      const rJudge =
+        summary.regular_avg_judge_score !== undefined ? summary.regular_avg_judge_score : rb.avg_judge_score ?? null;
+
+      return {
+        holdout: {
+          total: hTotal,
+          valid: hValid,
+          passed: hPassed,
+          skipped: hSkipped,
+          passRate: hRate,
+          estFullRate: hEstFull,
+          avgJudgeScore: hJudge,
+        },
+        regular: {
+          total: rTotal,
+          valid: rValid,
+          passed: rPassed,
+          skipped: rSkipped,
+          passRate: rRate,
+          estFullRate: rEstFull,
+          avgJudgeScore: rJudge,
+        },
+      };
+    }
+
+    // 兼容历史旧报告：从 sideBySideData 动态聚合
+    let hTotal = 0;
+    let hValid = 0;
+    let hPassed = 0;
+    let rTotal = 0;
+    let rValid = 0;
+    let rPassed = 0;
+    allSamples.forEach((sample) => {
+      const modelsMap = sample.results || sample.models || {};
+      const r = modelsMap[mId];
+      if (!r) return;
+      const isErr =
+        r.status === 'API_ERROR' ||
+        (r.content && r.content.startsWith('[API调用异常')) ||
+        (r.reply && r.reply.startsWith('[API调用异常'));
+      const isPass = !isErr && (r.status ? r.status === 'PASS' : !!r.objective_passed);
+      if (sample.is_holdout) {
+        hTotal++;
+        if (!isErr) {
+          hValid++;
+          if (isPass) hPassed++;
+        }
+      } else {
+        rTotal++;
+        if (!isErr) {
+          rValid++;
+          if (isPass) rPassed++;
+        }
+      }
+    });
+
+    return {
+      holdout: {
+        total: hTotal,
+        valid: hValid,
+        passed: hPassed,
+        skipped: 0,
+        passRate: hValid > 0 ? hPassed / hValid : null,
+        estFullRate: null,
+        avgJudgeScore: null,
+      },
+      regular: {
+        total: rTotal,
+        valid: rValid,
+        passed: rPassed,
+        skipped: 0,
+        passRate: rValid > 0 ? rPassed / rValid : null,
+        estFullRate: null,
+        avgJudgeScore: null,
+      },
+    };
+  };
 
   // 可选分类列表
   const categoryOptions = useMemo(() => {
@@ -290,6 +407,8 @@ export const BenchmarkReport: React.FC = () => {
 
       if (filterCategory !== 'ALL' && sample.category !== filterCategory) return false;
       if (filterDifficulty !== 'ALL' && sample.difficulty !== filterDifficulty) return false;
+      if (filterHoldout === 'HOLDOUT' && !sample.is_holdout) return false;
+      if (filterHoldout === 'REGULAR' && sample.is_holdout) return false;
 
       if (searchKeyword.trim()) {
         const kw = searchKeyword.trim().toLowerCase();
@@ -303,7 +422,7 @@ export const BenchmarkReport: React.FC = () => {
 
       return true;
     });
-  }, [allSamples, filterStatus, filterCategory, filterDifficulty, searchKeyword]);
+  }, [allSamples, filterStatus, filterCategory, filterDifficulty, filterHoldout, searchKeyword]);
 
   // 分页数据切片
   const pagedSamples = useMemo(() => {
@@ -499,7 +618,7 @@ export const BenchmarkReport: React.FC = () => {
                       </span>
                       <div className="text-3xs text-slate-600 mt-1 space-y-0.5">
                         <div>
-                          • <strong>实测通过率 (Sampled Pass Rate)</strong> = 实测通过数 ÷ 实测有效数 × 100%（针对本次实际抽出的高频错题/新题与到期巡检熟题，反映局部硬仗表现）
+                          • <strong>实测通过率 (Sampled Pass Rate)</strong> = 实测通过数 ÷ 实测有效数 × 100%（针对本次实际抽出的高频错题/新题与到期巡检熟题，反映局部硬仗表现；同时按<strong>留出题 (Holdout)</strong> 与<strong>普通题 (Regular)</strong> 独立区分统计）
                         </div>
                         {skippedSamplesCount > 0 ? (
                           <div>
@@ -507,7 +626,7 @@ export const BenchmarkReport: React.FC = () => {
                           </div>
                         ) : (
                           <div>
-                            • <strong>全集等效说明</strong>：当前题库所有题目均在必测攻坚池，尚未产生休眠熟题。待留出题 (<code className="font-mono">is_holdout=true</code>) 在同一模型线下连续通过不同版本达到门槛（x={samplingConfig?.pass_threshold_x ?? 3}）后将自动激活降频与分层折算。
+                            • <strong>学会与遗忘说明</strong>：当前题库所有题目均在必测攻坚池，尚未产生休眠熟题。待题目（无论留出题或普通题）在同一模型线下连续通过不同版本达到门槛（x={samplingConfig?.pass_threshold_x ?? 3}）后将自动激活降频与分层折算。
                           </div>
                         )}
                       </div>
@@ -539,6 +658,15 @@ export const BenchmarkReport: React.FC = () => {
                     const passRatePct = Math.round((s.pass_rate || 0) * 100);
                     const objRatePct = Math.round((s.objective_pass_rate || 0) * 100);
                     const hasApiErrors = (s.api_error_samples || 0) > 0;
+                    const hStats = resolveModelHoldoutStats(mId, s);
+                    const hRatePct =
+                      hStats.holdout.passRate !== null && hStats.holdout.passRate !== undefined
+                        ? Math.round(hStats.holdout.passRate * 100)
+                        : null;
+                    const rRatePct =
+                      hStats.regular.passRate !== null && hStats.regular.passRate !== undefined
+                        ? Math.round(hStats.regular.passRate * 100)
+                        : null;
                     return (
                       <Card
                         key={mId}
@@ -585,6 +713,77 @@ export const BenchmarkReport: React.FC = () => {
                               {s.valid_samples || s.passed_samples + s.failed_samples} / {s.total_samples} 题
                               {isSamplingEnabled && ` (全集 ${datasetTotal || s.dataset_total_samples || s.total_samples} 题)`}
                             </span>
+                          </div>
+
+                          {/* 留出题 vs 普通题 分层通过率对比面板 */}
+                          <div className="grid grid-cols-2 gap-1.5 text-3xs">
+                            <div className="px-2 py-1 rounded border border-purple-200 bg-purple-50/60 flex flex-col justify-between">
+                              <div className="flex items-center justify-between text-purple-900">
+                                <span className="font-semibold">🔒 留出题通过率</span>
+                                <span
+                                  className={`font-mono font-bold ${
+                                    hRatePct === null
+                                      ? 'text-slate-400'
+                                      : hRatePct >= 80
+                                      ? 'text-emerald-700'
+                                      : hRatePct >= 60
+                                      ? 'text-blue-700'
+                                      : 'text-orange-700'
+                                  }`}
+                                >
+                                  {hRatePct !== null ? `${hRatePct}%` : '—'}
+                                </span>
+                              </div>
+                              <div className="text-4xs text-slate-500 font-mono flex items-center justify-between mt-0.5">
+                                <span>
+                                  {hStats.holdout.valid > 0
+                                    ? `${hStats.holdout.passed}/${hStats.holdout.valid} 题`
+                                    : '无实测留出题'}
+                                </span>
+                                {isSamplingEnabled &&
+                                  hStats.holdout.skipped > 0 &&
+                                  hStats.holdout.estFullRate !== null &&
+                                  hStats.holdout.estFullRate !== undefined && (
+                                    <span className="text-purple-700 font-semibold" title="留出题全集等效通过率">
+                                      等效{Math.round(hStats.holdout.estFullRate * 100)}%
+                                    </span>
+                                  )}
+                              </div>
+                            </div>
+
+                            <div className="px-2 py-1 rounded border border-slate-200 bg-slate-50/80 flex flex-col justify-between">
+                              <div className="flex items-center justify-between text-slate-800">
+                                <span className="font-semibold">📄 普通题通过率</span>
+                                <span
+                                  className={`font-mono font-bold ${
+                                    rRatePct === null
+                                      ? 'text-slate-400'
+                                      : rRatePct >= 80
+                                      ? 'text-emerald-700'
+                                      : rRatePct >= 60
+                                      ? 'text-blue-700'
+                                      : 'text-orange-700'
+                                  }`}
+                                >
+                                  {rRatePct !== null ? `${rRatePct}%` : '—'}
+                                </span>
+                              </div>
+                              <div className="text-4xs text-slate-500 font-mono flex items-center justify-between mt-0.5">
+                                <span>
+                                  {hStats.regular.valid > 0
+                                    ? `${hStats.regular.passed}/${hStats.regular.valid} 题`
+                                    : '无实测普通题'}
+                                </span>
+                                {isSamplingEnabled &&
+                                  hStats.regular.skipped > 0 &&
+                                  hStats.regular.estFullRate !== null &&
+                                  hStats.regular.estFullRate !== undefined && (
+                                    <span className="text-purple-700 font-semibold" title="普通题全集等效通过率">
+                                      等效{Math.round(hStats.regular.estFullRate * 100)}%
+                                    </span>
+                                  )}
+                              </div>
+                            </div>
                           </div>
 
                           {isSamplingEnabled && (
@@ -659,52 +858,139 @@ export const BenchmarkReport: React.FC = () => {
                 </div>
               </div>
 
-              {/* 多场景分类折叠表格 */}
+              {/* 题型分层 (留出题 vs 普通题) 与多场景分类折叠表格 */}
               <Collapse ghost size="small" className="bg-white rounded-lg border border-slate-200">
                 <Panel
                   header={
                     <span className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
                       <ThunderboltOutlined className="text-amber-500" />
-                      点击展开各场景/细分类别通过率详细 Breakdown
+                      点击展开题型分层（🔒 留出题 vs 📄 普通题）与各场景分类通过率详细 Breakdown
                     </span>
                   }
                   key="breakdown"
                 >
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-xs text-left border-collapse">
-                      <thead>
-                        <tr className="bg-slate-50 border-b border-slate-200 text-slate-600">
-                          <th className="p-2 font-semibold">分类名称</th>
-                          {Object.keys(taskSummaries).map((m) => (
-                            <th key={m} className="p-2 font-semibold font-mono text-center">
-                              {m}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {categoryOptions.map((cat) => (
-                          <tr key={cat} className="border-b border-slate-100 hover:bg-slate-50/50">
-                            <td className="p-2 font-medium text-slate-700">{cat}</td>
-                            {Object.entries(taskSummaries).map(([mId, s]: [string, any]) => {
-                              const cInfo = s.category_breakdown?.[cat];
-                              if (!cInfo) return <td key={mId} className="p-2 text-center text-slate-300">—</td>;
-                              const pct = Math.round((cInfo.pass_rate || 0) * 100);
-                              return (
-                                <td key={mId} className="p-2 text-center font-mono">
-                                  <span className={pct >= 80 ? 'text-emerald-600 font-bold' : pct >= 60 ? 'text-blue-600' : 'text-orange-600 font-bold'}>
-                                    {pct}%
-                                  </span>
-                                  <span className="text-4xs text-slate-400 block">
-                                    ({cInfo.passed}/{cInfo.valid_count || cInfo.count})
-                                  </span>
-                                </td>
-                              );
-                            })}
+                  <div className="space-y-4">
+                    {/* 1. 留出题 vs 普通题 分层通过率对比表 */}
+                    <div className="overflow-x-auto">
+                      <div className="text-xs font-semibold text-slate-700 mb-1.5">
+                        1. 题型分层通过率对比（留出题 Holdout vs 普通题 Regular）
+                      </div>
+                      <table className="w-full text-xs text-left border-collapse border border-slate-200">
+                        <thead>
+                          <tr className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                            <th className="p-2 font-semibold">题型分类</th>
+                            {Object.keys(taskSummaries).map((m) => (
+                              <th key={m} className="p-2 font-semibold font-mono text-center">
+                                {m}
+                              </th>
+                            ))}
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                        </thead>
+                        <tbody>
+                          {(
+                            [
+                              { key: 'holdout', label: '🔒 留出题 (is_holdout=true)', tagColor: 'purple' },
+                              { key: 'regular', label: '📄 普通题 (is_holdout=false)', tagColor: 'default' },
+                            ] as const
+                          ).map((rowDef) => (
+                            <tr key={rowDef.key} className="border-b border-slate-100 hover:bg-slate-50/50">
+                              <td className="p-2 font-medium text-slate-700">
+                                <Tag color={rowDef.tagColor} className="m-0 text-3xs font-semibold">
+                                  {rowDef.label}
+                                </Tag>
+                              </td>
+                              {Object.entries(taskSummaries).map(([mId, s]: [string, any]) => {
+                                const hStats = resolveModelHoldoutStats(mId, s);
+                                const gInfo = hStats[rowDef.key];
+                                if (!gInfo || (gInfo.valid === 0 && gInfo.skipped === 0)) {
+                                  return (
+                                    <td key={mId} className="p-2 text-center text-slate-300 font-mono">
+                                      — (0题)
+                                    </td>
+                                  );
+                                }
+                                const pct =
+                                  gInfo.passRate !== null && gInfo.passRate !== undefined
+                                    ? Math.round(gInfo.passRate * 100)
+                                    : null;
+                                return (
+                                  <td key={mId} className="p-2 text-center font-mono">
+                                    {pct !== null ? (
+                                      <span
+                                        className={
+                                          pct >= 80
+                                            ? 'text-emerald-600 font-bold'
+                                            : pct >= 60
+                                            ? 'text-blue-600 font-semibold'
+                                            : 'text-orange-600 font-bold'
+                                        }
+                                      >
+                                        {pct}%
+                                      </span>
+                                    ) : (
+                                      <span className="text-slate-400">未抽测</span>
+                                    )}
+                                    <span className="text-4xs text-slate-400 block">
+                                      实测 ({gInfo.passed}/{gInfo.valid})
+                                      {gInfo.skipped > 0 ? ` · 休眠 ${gInfo.skipped}` : ''}
+                                      {gInfo.estFullRate !== null &&
+                                      gInfo.estFullRate !== undefined &&
+                                      gInfo.skipped > 0
+                                        ? ` · 等效 ${Math.round(gInfo.estFullRate * 100)}%`
+                                        : ''}
+                                      {gInfo.avgJudgeScore !== null && gInfo.avgJudgeScore !== undefined
+                                        ? ` · 均分 ${gInfo.avgJudgeScore}`
+                                        : ''}
+                                    </span>
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* 2. 各业务场景/细分类别通过率对比表 */}
+                    <div className="overflow-x-auto">
+                      <div className="text-xs font-semibold text-slate-700 mb-1.5">
+                        2. 业务场景分类通过率对比（Category Breakdown）
+                      </div>
+                      <table className="w-full text-xs text-left border-collapse border border-slate-200">
+                        <thead>
+                          <tr className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                            <th className="p-2 font-semibold">分类名称</th>
+                            {Object.keys(taskSummaries).map((m) => (
+                              <th key={m} className="p-2 font-semibold font-mono text-center">
+                                {m}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {categoryOptions.map((cat) => (
+                            <tr key={cat} className="border-b border-slate-100 hover:bg-slate-50/50">
+                              <td className="p-2 font-medium text-slate-700">{cat}</td>
+                              {Object.entries(taskSummaries).map(([mId, s]: [string, any]) => {
+                                const cInfo = s.category_breakdown?.[cat];
+                                if (!cInfo) return <td key={mId} className="p-2 text-center text-slate-300">—</td>;
+                                const pct = Math.round((cInfo.pass_rate || 0) * 100);
+                                return (
+                                  <td key={mId} className="p-2 text-center font-mono">
+                                    <span className={pct >= 80 ? 'text-emerald-600 font-bold' : pct >= 60 ? 'text-blue-600' : 'text-orange-600 font-bold'}>
+                                      {pct}%
+                                    </span>
+                                    <span className="text-4xs text-slate-400 block">
+                                      ({cInfo.passed}/{cInfo.valid_count || cInfo.count})
+                                    </span>
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
                 </Panel>
               </Collapse>
@@ -846,6 +1132,21 @@ export const BenchmarkReport: React.FC = () => {
                 ]}
               />
 
+              <Select
+                value={filterHoldout}
+                onChange={(val) => {
+                  setFilterHoldout(val);
+                  setCurrentPage(1);
+                }}
+                size="small"
+                className="w-40"
+                options={[
+                  { value: 'ALL', label: `全部题型 (${counts.all})` },
+                  { value: 'HOLDOUT', label: `🔒 仅留出题 (${counts.holdout})` },
+                  { value: 'REGULAR', label: `📄 仅普通题 (${counts.regular})` },
+                ]}
+              />
+
               <span className="text-xs text-slate-500 font-mono ml-auto">
                 筛选共 <span className="font-bold text-slate-800">{filteredSamples.length}</span> 条
               </span>
@@ -875,6 +1176,9 @@ export const BenchmarkReport: React.FC = () => {
                             <span className="font-mono text-xs font-bold text-slate-800">
                               #{sample.sample_id}
                             </span>
+                            <Tag color={sample.is_holdout ? 'purple' : 'default'} className="text-3xs">
+                              {sample.is_holdout ? '🔒 留出题 (Holdout)' : '📄 普通题 (Regular)'}
+                            </Tag>
                             {sample.category && (
                               <Tag color="blue" className="text-3xs">
                                 {sample.category}

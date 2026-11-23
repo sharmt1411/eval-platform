@@ -803,11 +803,11 @@ export const DatasetCenter: React.FC = () => {
             {watchedImportDatasetType === 'benchmark' && (
               <Form.Item
                 name="mark_as_holdout"
-                label="标记为纯评测留出题 (is_holdout)"
+                label="默认题型标记 (is_holdout)"
                 valuePropName="checked"
-                extra="仅外部导入纯测试集开启；与训练集同源的样本请关闭以禁止降频"
+                extra="标记为留出题 (is_holdout=true) 或普通题 (is_holdout=false)；两种题型均支持学会降频、遗忘追踪与评测过滤，评测报告将按留出与普通区分统计通过率"
               >
-                <Switch checkedChildren="留出评测题 (允许降频)" unCheckedChildren="同源题 (强制全测)" />
+                <Switch checkedChildren="🔒 留出题 (Holdout)" unCheckedChildren="📄 普通题 (Regular)" />
               </Form.Item>
             )}
           </div>
@@ -894,7 +894,7 @@ export const DatasetCenter: React.FC = () => {
                 <span className="text-xs font-semibold text-slate-800">1. 导出方式与目标</span>
                 {filterOptions && (
                   <span className="text-3xs text-slate-500 font-mono">
-                    总计 {filterOptions.total_samples} 题（留出题 {filterOptions.holdout_count} / 同源题 {filterOptions.non_holdout_count}）
+                    总计 {filterOptions.total_samples} 题（留出题 {filterOptions.holdout_count} / 普通题 {filterOptions.non_holdout_count}）
                   </span>
                 )}
               </div>
@@ -973,8 +973,8 @@ export const DatasetCenter: React.FC = () => {
                   popupMatchSelectWidth={false}
                   options={[
                     { value: 'sampled', label: '🎯 本轮抽样命中题单（必测攻坚 + 触顶保底 + 降频轮巡抽中）' },
-                    { value: 'active_only', label: '🔴 仅必测攻坚池（I=1：新题 / 未达门槛 / 失败 / 同源非留出题）' },
-                    { value: 'cooldown_all', label: '🟢 仅全部熟题池（I>1：已连续通过门槛且为留出题）' },
+                    { value: 'active_only', label: '🔴 仅必测攻坚池（I=1：新题 / 未达门槛 / 复测失败遗忘题）' },
+                    { value: 'cooldown_all', label: '🟢 仅全部熟题池（I>1：已连续达标学会的留出题与普通题）' },
                     { value: 'skipped', label: '💤 仅本轮休眠免测熟题（本轮降频跳过的题目）' },
                     { value: 'failed_only', label: '❌ 仅最近一次失败题（该模型线下 last_status = FAIL）' },
                     { value: 'all', label: '📦 全量样本（跳过三池抽样，仅应用基础属性过滤）' },
@@ -1084,14 +1084,14 @@ export const DatasetCenter: React.FC = () => {
                   />
                 </Form.Item>
 
-                <Form.Item name="holdout_filter" label={<span className="text-3xs text-slate-700">留出属性</span>} className="m-0">
+                <Form.Item name="holdout_filter" label={<span className="text-3xs text-slate-700">题型属性</span>} className="m-0">
                   <Select
                     size="small"
                     popupMatchSelectWidth={false}
                     options={[
-                      { value: 'all', label: '全部题目' },
+                      { value: 'all', label: '全部题型 (留出 + 普通)' },
                       { value: 'holdout_only', label: '🔒 仅留出评测题 (is_holdout=true)' },
-                      { value: 'non_holdout_only', label: '同源非留出题 (is_holdout=false)' },
+                      { value: 'non_holdout_only', label: '📄 仅普通题 (is_holdout=false)' },
                     ]}
                   />
                 </Form.Item>
@@ -1217,7 +1217,7 @@ export const DatasetCenter: React.FC = () => {
                         </Tag>
                         {isBenchmarkSample && (
                           <Tag color={sample.is_holdout ? 'purple' : 'default'}>
-                            {sample.is_holdout ? '🔒 留出评测题 (可降频)' : '同源题 (I=1)'}
+                            {sample.is_holdout ? '🔒 留出题 (Holdout)' : '📄 普通题 (Regular)'}
                           </Tag>
                         )}
                         <Tag color="blue">
