@@ -1278,15 +1278,31 @@ def test_cli_end_to_end_all_groups(
     )
     assert rc == 0 and brem_res["total"] == 1
 
-    # 恢复人工状态并验证 batch-status / export-selected
+    # 恢复人工状态并验证 batch-status / export-selected（先验证默认排除已切题留出样本，再传 --no-exclude-benchmark-exported 显式放行）
     rc, bs_res, _ = _run_main(
         ["--in-process", "flywheel", "batch-status", "--sample-id", fw_sample_id, "--status", "MANUAL_APPROVED"],
         capsys,
     )
     assert rc == 0 and bs_res["updated_count"] == 1
 
+    rc_blocked, _, err_blocked = _run_main(
+        ["--in-process", "flywheel", "export-selected", "--sample-id", fw_sample_id, "--version-tag", "cli_sel_blocked"],
+        capsys,
+    )
+    assert rc_blocked != 0
+    assert "留出" in err_blocked or "BENCHMARK" in err_blocked or "HTTP_400" in err_blocked or "导出" in err_blocked
+
     rc, es_res, _ = _run_main(
-        ["--in-process", "flywheel", "export-selected", "--sample-id", fw_sample_id, "--version-tag", "cli_sel"],
+        [
+            "--in-process",
+            "flywheel",
+            "export-selected",
+            "--sample-id",
+            fw_sample_id,
+            "--version-tag",
+            "cli_sel",
+            "--no-exclude-benchmark-exported",
+        ],
         capsys,
     )
     assert rc == 0 and es_res["sample_count"] == 1

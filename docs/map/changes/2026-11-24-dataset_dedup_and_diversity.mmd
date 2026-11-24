@@ -1,0 +1,25 @@
+%% title: 数据集去重防稀释与规则隔离变更图
+flowchart LR
+    judge["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine\n新增faq_details全量留痕"]
+    slicer["测评切题引擎\nbackend/app/engine/slicer.py:ProgressiveContextSlicer\n透传rule/node/faq元数据"]
+    dedup["去重防稀释引擎\nbackend/app/engine/deduplicator.py:DatasetDeduplicator\n新增核心引擎"]
+    fw_svc["飞轮编排服务\nbackend/app/services/flywheel_service.py:FlywheelPipelineService\n编排去重与导出过滤"]
+    deps["路由公共依赖\nbackend/app/api/deps.py:upsert_flywheel_sample\n新增规则隔离双哈希Upsert"]
+    orm_fw[("飞轮样本表\nbackend/app/models/base.py:FlywheelSampleRecord\n新增用户序列双哈希索引")]
+    api_fw["飞轮工作台API\nbackend/app/api/flywheel.py\n接入Upsert/防泄漏/去重导出"]
+    api_ds["数据集管理API\nbackend/app/api/datasets.py\nappend去重与缓存清理"]
+    ui_fw["飞轮复核台\nfrontend/src/pages/FlywheelWorkbench.tsx\n新增导出防重配额开关"]
+    ui_ds["数据资产中心\nfrontend/src/pages/DatasetCenter.tsx\n新增导入导出去重开关"]
+    cli_cmd["CLI命令层\ncli/commands/flywheel.py\n新增去重防稀释选项"]
+
+    judge -->|"输出trajectory与faq_details"| fw_svc
+    slicer -->|"生成携带定位标签切题"| fw_svc
+    fw_svc -->|"评测/训练集四步去重"| dedup
+    deps -->|"计算raw与remed双哈希"| fw_svc
+    deps -->|"惰性回填并原位Upsert"| orm_fw
+    api_fw -->|"样本入池与导出留出互斥"| deps
+    api_fw -->|"调用去重导出编排"| fw_svc
+    api_ds -->|"append局部桶与缓存去重"| dedup
+    ui_fw -->|"下发去重配置与互斥开关"| api_fw
+    ui_ds -->|"下发导入导出去重配置"| api_ds
+    cli_cmd -->|"透传去重参数到导出接口"| api_fw

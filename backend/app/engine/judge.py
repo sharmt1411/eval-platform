@@ -19,6 +19,7 @@ from backend.app.schemas.chat import (
 from backend.app.schemas.rule import (
     UniversalRuleSchema,
     PersonaDefinition,
+    FAQItem,
     DEFAULT_TRAJECTORY_EXTRACT_PROMPT_TEMPLATE,
     DEFAULT_SOP_DYNAMICS_BLOCK,
     DEFAULT_JUDGE_PROMPT_TEMPLATE,
@@ -105,6 +106,19 @@ class UniversalJudgeEngine:
                 return default
             parsed = int(round(float(val)))
             return max(0, min(100, parsed))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _safe_turn_int(val: Any, default: int = 0) -> int:
+        """安全解析对话轮次整型编号（不做 100 上限钳位）"""
+        try:
+            if val is None or isinstance(val, bool):
+                return default
+            if isinstance(val, int):
+                return val
+            digits: List[str] = re.findall(r"\d+", str(val))
+            return int(digits[0]) if digits else default
         except Exception:
             return default
 
@@ -454,9 +468,10 @@ class UniversalJudgeEngine:
         retrieved_candidates: List[Dict[str, Any]],
         dialogue: List[ChatMessage],
         debug_collector: Optional[List[Dict[str, Any]]] = None,
+        faq_meta_out: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Step B2: 专职 FAQ 准确度法官裁决
+        Step B2: 专职 FAQ 准确度法官裁决（可通过 faq_meta_out 回传顶层 matched_faq_id）
         """
         a_turn: int = 0
         req: Optional[UnifiedChatRequest] = None
@@ -504,6 +519,10 @@ class UniversalJudgeEngine:
                     )
                 )
             result = self._extract_json_from_response(resp.content)
+            if faq_meta_out is not None and isinstance(result, dict):
+                judged_fid = str(result.get("matched_faq_id") or "").strip()
+                if judged_fid:
+                    faq_meta_out["matched_faq_id"] = judged_fid
             deductions = result.get("faq_deductions", [])
             if isinstance(deductions, list):
                 for d in deductions:
@@ -729,6 +748,7 @@ class UniversalJudgeEngine:
 
         # ------------------ 轨道二: FAQ 问答准确度质检 (开启才触发) ------------------
         faq_deductions: List[Dict[str, Any]] = []
+        faq_details: List[Dict[str, Any]] = []
         if has_faq:
             # Step B1: 提取 FAQ 提问轮次 + 问题改写
             faq_rounds = self.extract_faq_rounds_and_rewrite(
@@ -736,14 +756,100 @@ class UniversalJudgeEngine:
             )
             if faq_rounds:
                 retriever = UniversalFAQRetriever(rule.faq_inspection)
+                valid_kb_ids = {
+                    str(it.id or "").strip()
+                    for it in (rule.faq_inspection.knowledge_base or [])
+                    if str(it.id or "").strip()
+                }
+                ood_markers = {"FAQ_OOD", "OOD", "NONE", "NULL", "OUT_OF_KB", "无"}
                 for fr in faq_rounds:
-                    query = fr.get("rewritten_query") or fr.get("raw_user_question", "")
+                    query = str(fr.get("rewritten_query") or fr.get("raw_user_question") or "").strip()
                     if not query:
                         continue
+                    u_turn: int = self._safe_turn_int(fr.get("user_turn", 0), default=0)
+                    a_turn: int = self._safe_turn_int(fr.get("assistant_turn", 0), default=0)
                     candidates = retriever.search(query, top_k=rule.faq_inspection.top_k)
+                    faq_meta: Dict[str, Any] = {}
                     r_deductions = self.evaluate_faq_accuracy(
-                        rule, scenario, fr, candidates, dialogue, debug_collector=debug_requests
+                        rule,
+                        scenario,
+                        fr,
+                        candidates,
+                        dialogue,
+                        debug_collector=debug_requests,
+                        faq_meta_out=faq_meta,
                     )
+
+                    resolved_faq_id: str = "FAQ_OOD"
+                    is_ood: bool = True
+                    judged_top_fid: str = str(faq_meta.get("matched_faq_id") or "").strip()
+
+                    if r_deductions:
+                        valid_ded_fid: str = ""
+                        for d_item in r_deductions:
+                            if not isinstance(d_item, dict):
+                                continue
+                            cand_fid: str = str(d_item.get("matched_faq_id") or "").strip()
+                            if cand_fid and cand_fid.upper() not in ood_markers:
+                                valid_ded_fid = cand_fid
+                                break
+                        if not valid_ded_fid and judged_top_fid and judged_top_fid.upper() not in ood_markers:
+                            if not valid_kb_ids or judged_top_fid in valid_kb_ids:
+                                valid_ded_fid = judged_top_fid
+                        if valid_ded_fid:
+                            resolved_faq_id = valid_ded_fid
+                            is_ood = False
+                        else:
+                            resolved_faq_id = "FAQ_OOD"
+                            is_ood = True
+                            for d_item in r_deductions:
+                                if isinstance(d_item, dict):
+                                    cur_fid: str = str(d_item.get("matched_faq_id") or "").strip()
+                                    if not cur_fid or cur_fid.upper() in ood_markers:
+                                        d_item["matched_faq_id"] = "FAQ_OOD"
+                    else:
+                        if judged_top_fid and judged_top_fid.upper() in ood_markers:
+                            resolved_faq_id = "FAQ_OOD"
+                            is_ood = True
+                        elif judged_top_fid and (not valid_kb_ids or judged_top_fid in valid_kb_ids):
+                            resolved_faq_id = judged_top_fid
+                            is_ood = False
+                        elif candidates:
+                            top_cand: Dict[str, Any] = candidates[0]
+                            top_faq: Any = top_cand.get("faq")
+                            top_fid: str = ""
+                            if isinstance(top_faq, FAQItem):
+                                top_fid = str(top_faq.id or "").strip()
+                            elif isinstance(top_faq, dict):
+                                top_fid = str(top_faq.get("id") or "").strip()
+                            elif top_faq is not None:
+                                top_fid = str(getattr(top_faq, "id", "") or "").strip()
+
+                            if "raw_hit" in top_cand:
+                                is_real_hit = bool(top_cand.get("raw_hit"))
+                            else:
+                                lex_val = top_cand.get("lexical_score")
+                                den_val = top_cand.get("dense_score")
+                                src_val = str(top_cand.get("retrieval_source") or "")
+                                if src_val == "hybrid_rrf":
+                                    is_real_hit = bool(
+                                        (lex_val is not None and float(lex_val) >= 1.5)
+                                        or (den_val is not None and float(den_val) >= 0.45)
+                                    )
+                                else:
+                                    is_real_hit = float(top_cand.get("score") or 0.0) > 0.0
+
+                            if is_real_hit and top_fid:
+                                resolved_faq_id = top_fid
+                                is_ood = False
+
+                    faq_details.append({
+                        "user_turn": u_turn,
+                        "assistant_turn": a_turn,
+                        "rewritten_query": query,
+                        "matched_faq_id": resolved_faq_id,
+                        "is_ood": is_ood,
+                    })
                     faq_deductions.extend(r_deductions)
 
         # ------------------ 代码层汇合: 双轨扣分合并与统一算分 ------------------
@@ -809,6 +915,7 @@ class UniversalJudgeEngine:
             deductions=all_deductions,
             node_trajectory=clean_nodes,
             trajectory_details=trajectory_details,
+            faq_details=faq_details,
             topology_valid=is_topo_valid,
             topology_error=topo_err if not is_topo_valid else None,
             flow_checkpoints=eval_data.get("flow_checkpoints", {}),

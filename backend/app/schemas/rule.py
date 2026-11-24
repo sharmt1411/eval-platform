@@ -368,6 +368,7 @@ DEFAULT_FAQ_JUDGE_PROMPT_TEMPLATE = """# 业务问答 (FAQ) 准确度专职质�
 请严格输出纯 JSON 对象，格式如下:
 ```json
 {
+  "matched_faq_id": "FAQ_001",
   "faq_deductions": [
     {
       "turn": 14,
@@ -380,7 +381,9 @@ DEFAULT_FAQ_JUDGE_PROMPT_TEMPLATE = """# 业务问答 (FAQ) 准确度专职质�
   ]
 }
 ```
-**特别注意**: 若坐席问答完全准确合规，"faq_deductions" 必须输出为空数组 `[]`！
+**特别注意**:
+- 若坐席问答完全准确合规，"faq_deductions" 必须输出为空数组 `[]`；
+- 无扣分时也请在顶层返回 `"matched_faq_id"`：若问题确实对应候选库中某条 FAQ 且坐席回答准确，填入对应 FAQ 的 ID（如 `"FAQ_001"`）；若客户问题属于知识库未覆盖的超纲问题且坐席已按兜底规范合规回应，请填入 `"FAQ_OOD"`！
 
 <!-- USER_INPUT_START -->
 ## 场景上下文

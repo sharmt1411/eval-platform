@@ -9,6 +9,7 @@ flowchart TB
   api_rules["规则中心路由\nbackend/app/api/rules.py"]
   api_models["模型管理路由\nbackend/app/api/models.py"]
   benchmark_sampler["抽样与账本引擎\nbackend/app/engine/benchmark_sampler.py:BenchmarkSamplingEngine"]
+  deduplicator["去重防稀释引擎\nbackend/app/engine/deduplicator.py:DatasetDeduplicator"]
   sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\n表: DatasetRecord/BenchmarkRunLedger")]
   datasets_dir[("本地数据集目录\ndata/datasets")]
 
@@ -17,6 +18,8 @@ flowchart TB
   dataset_center -->|"读取规则列表"| api_rules
   dataset_center -->|"读取裁判模型列表"| api_models
   api_datasets -->|"计算采样状态/条件过滤导出"| benchmark_sampler
+  api_datasets -->|"append与导出去重防稀释"| deduplicator
+  deduplicator -->|"读写.dedup_cache缓存"| datasets_dir
   api_datasets -->|"读写DatasetRecord"| sqlite_db
   api_datasets -->|"读写JSONL数据集文件"| datasets_dir
   benchmark_sampler -->|"查BenchmarkRunLedger"| sqlite_db

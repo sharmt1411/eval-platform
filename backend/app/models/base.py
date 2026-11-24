@@ -10,7 +10,7 @@ from backend.app.config import settings
 
 engine = create_engine(
     settings.DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {},
+    connect_args={"check_same_thread": False, "timeout": 30} if "sqlite" in settings.DATABASE_URL else {},
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -87,6 +87,8 @@ class FlywheelSampleRecord(Base):
     verified_eval_json = Column(Text, default="{}")
     reviewer_comment = Column(Text, default="")
     exported_to_benchmark = Column(Boolean, default=False)
+    raw_user_hash = Column(String(64), nullable=True, index=True)
+    remediated_user_hash = Column(String(64), nullable=True, index=True)
     updated_at = Column(Integer, default=lambda: int(time.time()))
 
 
@@ -143,6 +145,14 @@ def init_db():
                 conn.commit()
             if "exported_to_benchmark" not in existing_cols:
                 conn.execute(text("ALTER TABLE flywheel_samples ADD COLUMN exported_to_benchmark BOOLEAN DEFAULT 0"))
+                conn.commit()
+            if "raw_user_hash" not in existing_cols:
+                conn.execute(text("ALTER TABLE flywheel_samples ADD COLUMN raw_user_hash VARCHAR(64)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_flywheel_samples_raw_user_hash ON flywheel_samples (raw_user_hash)"))
+                conn.commit()
+            if "remediated_user_hash" not in existing_cols:
+                conn.execute(text("ALTER TABLE flywheel_samples ADD COLUMN remediated_user_hash VARCHAR(64)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_flywheel_samples_remediated_user_hash ON flywheel_samples (remediated_user_hash)"))
                 conn.commit()
         except Exception as e:
             # 若表尚未创建或其他方言忽略

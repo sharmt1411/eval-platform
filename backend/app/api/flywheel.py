@@ -3,12 +3,14 @@
 数据飞轮与人工复核工作台 API
 """
 import os
+import re
 import json
 import time
 import uuid
 import hashlib
-from typing import List, Dict, Any, Optional, Tuple
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
+import threading
+from typing import List, Dict, Any, Optional, Tuple, Set
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Body
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from backend.app.config import settings
@@ -22,8 +24,13 @@ from backend.app.models import (
 from backend.app.schemas.chat import ChatMessage
 from backend.app.schemas.rule import PersonaDefinition, UniversalRuleSchema
 from backend.app.schemas.flywheel import (
+    BatchUpdateStatusRequest,
+    BatchDeleteSamplesRequest,
+    BatchExportSelectedRequest,
+    BatchFlywheelRunRequest,
     BatchJudgeRequest,
     BatchRemediateRequest,
+    DedupConfig,
     FlywheelRecord,
     InspectionReport,
     SingleJudgeRequest,
@@ -33,7 +40,12 @@ from backend.app.schemas.flywheel import (
     BatchExportBenchmarkRequest,
     DatasetInspectRequest,
 )
-from backend.app.api.deps import get_adapter_and_config_by_model_id, load_rule_schema
+from backend.app.api.deps import (
+    get_adapter_and_config_by_model_id,
+    load_rule_schema,
+    messages_to_dicts,
+    upsert_flywheel_sample,
+)
 from backend.app.services.flywheel_service import FlywheelPipelineService
 from backend.app.engine.benchmark_sampler import BenchmarkSamplingEngine
 
@@ -46,14 +58,31 @@ class SampleReviewUpdateRequest(BaseModel):
     reviewer_comment: Optional[str] = None
 
 
-class BatchUpdateStatusRequest(BaseModel):
-    sample_ids: List[str] = Field(..., min_length=1)
-    status: str  # GOLD_PASS / REPAIRED_PASS / DISCARDED / MANUAL_APPROVED
-    reviewer_comment: Optional[str] = None
+class ExportGoldOptionsBody(BaseModel):
+    mode: Optional[str] = None
+    target_dataset_id: Optional[str] = None
+    dedup_config: Optional[DedupConfig] = None
 
 
-class BatchDeleteSamplesRequest(BaseModel):
-    sample_ids: List[str] = Field(..., min_length=1)
+def _refresh_sample_user_hashes(
+    sample: FlywheelSampleRecord,
+    raw_msgs: Optional[List[Any]] = None,
+    remed_msgs: Optional[List[Any]] = None,
+) -> None:
+    """同步刷新 FlywheelSampleRecord 的原/修后客户输入序列双哈希。"""
+    raw_src: List[Any] = (
+        raw_msgs
+        if raw_msgs is not None
+        else json.loads(sample.raw_messages_json or "[]")
+    )
+    remed_src: Optional[List[Any]] = (
+        remed_msgs
+        if remed_msgs is not None
+        else (json.loads(sample.remediated_messages_json) if sample.remediated_messages_json else None)
+    )
+    raw_h, remed_h = FlywheelPipelineService.compute_dialogue_user_hashes(raw_src, remed_src)
+    sample.raw_user_hash = raw_h
+    sample.remediated_user_hash = remed_h
 
 
 def _parse_existing_initial_eval(sample: FlywheelSampleRecord) -> Optional[InspectionReport]:
@@ -68,22 +97,6 @@ def _parse_existing_initial_eval(sample: FlywheelSampleRecord) -> Optional[Inspe
         except Exception:
             pass
     return None
-
-
-class BatchExportSelectedRequest(BaseModel):
-    sample_ids: List[str] = Field(..., min_length=1)
-    version_tag: str = "v1.0"
-    inject_thinking: bool = False
-
-
-class BatchFlywheelRunRequest(BaseModel):
-    rule_id: str
-    input_file_path: str
-    gold_output_path: Optional[str] = None
-    discard_output_path: Optional[str] = None
-    judge_model_id: str
-    remediate_model_id: Optional[str] = None
-    workers: int = 4
 
 
 @router.post("/samples/batch-status")
@@ -347,7 +360,8 @@ def batch_remediate_samples(
                 continue
 
             remed_msgs: List[ChatMessage] = updated_rec.remediated_messages or []
-            sample.remediated_messages_json = json.dumps([m.to_dict() for m in remed_msgs], ensure_ascii=False)
+            sample.remediated_messages_json = json.dumps(messages_to_dicts(remed_msgs), ensure_ascii=False)
+            _refresh_sample_user_hashes(sample, raw_msgs=raw_msgs, remed_msgs=remed_msgs)
             sample.verified_eval_json = (
                 json.dumps(updated_rec.verified_eval.model_dump(), ensure_ascii=False)
                 if updated_rec.verified_eval
@@ -388,13 +402,130 @@ def batch_remediate_samples(
     }
 
 
+def _export_training_rows_to_dataset(
+    db: Session,
+    samples: List[FlywheelSampleRecord],
+    export_path: str,
+    dataset_id: str,
+    inject_thinking: bool,
+    mode: str = "create",
+    dedup_config: Optional[DedupConfig] = None,
+) -> Tuple[int, Dict[str, Any]]:
+    """构建带轨迹/FAQ 元数据的候选对话，执行四步去重防稀释写盘并注册 DatasetRecord。"""
+    candidate_rows: List[Dict[str, Any]] = []
+    for s in samples:
+        msgs = json.loads(s.remediated_messages_json or s.raw_messages_json or "[]")
+        clean_msgs: List[Dict[str, Any]] = []
+        for m in msgs:
+            entry: Dict[str, Any] = {"role": m.get("role"), "content": m.get("content")}
+            if inject_thinking and entry["role"] == "assistant":
+                entry["thinking"] = m.get("thinking", "")
+            clean_msgs.append(entry)
+
+        init_eval: Dict[str, Any] = {}
+        ver_eval: Dict[str, Any] = {}
+        try:
+            init_eval = json.loads(s.initial_eval_json or "{}")
+        except Exception:
+            pass
+        try:
+            ver_eval = json.loads(s.verified_eval_json or "{}")
+        except Exception:
+            pass
+
+        dedup_meta: Dict[str, Any] = FlywheelPipelineService.extract_sample_dedup_meta(
+            init_eval if isinstance(init_eval, dict) else None,
+            ver_eval if isinstance(ver_eval, dict) else None,
+        )
+        candidate_rows.append({
+            "id": s.id,
+            "metadata": {
+                "rule_id": s.rule_id,
+                "scenario_id": s.scenario_id,
+                "status": s.status,
+                "score": s.score,
+                "reviewer_comment": s.reviewer_comment,
+            },
+            "messages": clean_msgs,
+            "_dedup_meta": dedup_meta,
+        })
+
+    existing_rows: Optional[List[Dict[str, Any]]] = None
+    if mode == "append" and os.path.exists(export_path):
+        loaded: List[Dict[str, Any]] = []
+        with open(export_path, "r", encoding="utf-8") as ef:
+            for line in ef:
+                s_line = line.strip()
+                if s_line:
+                    try:
+                        obj = json.loads(s_line)
+                        if isinstance(obj, dict):
+                            loaded.append(obj)
+                    except Exception:
+                        pass
+        existing_rows = loaded
+
+    final_rows, dedup_stats = FlywheelPipelineService.deduplicate_training_export(
+        candidate_rows=candidate_rows,
+        existing_rows=existing_rows,
+        config=dedup_config,
+        dataset_file_path=export_path,
+    )
+
+    os.makedirs(settings.DATASETS_DIR, exist_ok=True)
+    tmp_path: str = f"{export_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for row in final_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, export_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise
+
+    if mode == "create" and not bool(dedup_stats.get("enabled")):
+        stale_cache = FlywheelPipelineService.get_dedup_cache_path(export_path)
+        if os.path.exists(stale_cache):
+            try:
+                os.remove(stale_cache)
+            except Exception:
+                pass
+
+    export_fname: str = os.path.basename(export_path)
+    ds_rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if ds_rec is None:
+        ds_rec = DatasetRecord(
+            id=dataset_id,
+            name=export_fname,
+            file_path=export_path,
+            sample_count=len(final_rows),
+            dataset_type="flywheel_gold",
+            created_at=int(time.time()),
+        )
+        db.add(ds_rec)
+    else:
+        ds_rec.name = export_fname
+        ds_rec.file_path = export_path
+        ds_rec.sample_count = len(final_rows)
+        ds_rec.dataset_type = "flywheel_gold"
+        ds_rec.created_at = int(time.time())
+    db.commit()
+
+    return len(final_rows), dedup_stats
+
+
 @router.post("/samples/export-selected")
 def export_selected_samples(
     payload: BatchExportSelectedRequest,
     db: Session = Depends(get_db),
 ):
     """
-    从复核池中将选中的特定样本导出为标准 messages 格式的数据集 (.jsonl)
+    从复核池中将选中的特定样本导出为标准 messages 格式的数据集 (.jsonl)，
+    默认排除已导出进评测集的留出题源对话，并应用去重防稀释。
     """
     samples = (
         db.query(FlywheelSampleRecord)
@@ -404,36 +535,39 @@ def export_selected_samples(
     if not samples:
         raise HTTPException(status_code=400, detail="未找到选中的复核样本")
 
-    export_fname = f"flywheel_selected_{payload.version_tag}_{int(time.time())}.jsonl"
-    export_path = os.path.join(settings.DATASETS_DIR, export_fname)
+    if payload.exclude_benchmark_exported:
+        samples = [s for s in samples if not bool(s.exported_to_benchmark)]
+        if not samples:
+            raise HTTPException(
+                status_code=400,
+                detail="所选样本均已标记为留出评测集源对话 (exported_to_benchmark=True)，默认已拦截防数据泄漏",
+            )
 
-    with open(export_path, "w", encoding="utf-8") as f:
-        for s in samples:
-            msgs = json.loads(s.remediated_messages_json or s.raw_messages_json or "[]")
-            clean_msgs = []
-            for m in msgs:
-                entry = {"role": m.get("role"), "content": m.get("content")}
-                if payload.inject_thinking and entry["role"] == "assistant":
-                    entry["thinking"] = m.get("thinking", "")
-                clean_msgs.append(entry)
+    raw_did: str = (payload.target_dataset_id or "").strip()
+    if raw_did:
+        dataset_id: str = re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fa5]", "_", raw_did)
+        if dataset_id.endswith(".jsonl"):
+            dataset_id = dataset_id[:-6]
+    else:
+        dataset_id = f"flywheel_selected_{payload.version_tag}_{int(time.time())}"
+    export_path = os.path.join(settings.DATASETS_DIR, f"{dataset_id}.jsonl")
 
-            row = {
-                "id": s.id,
-                "metadata": {
-                    "rule_id": s.rule_id,
-                    "scenario_id": s.scenario_id,
-                    "status": s.status,
-                    "score": s.score,
-                    "reviewer_comment": s.reviewer_comment,
-                },
-                "messages": clean_msgs,
-            }
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    final_count, dedup_stats = _export_training_rows_to_dataset(
+        db=db,
+        samples=samples,
+        export_path=export_path,
+        dataset_id=dataset_id,
+        inject_thinking=payload.inject_thinking,
+        mode=payload.mode,
+        dedup_config=payload.dedup_config,
+    )
 
     return {
-        "message": f"选中样本导出成功 (共 {len(samples)} 条)",
+        "message": f"选中样本导出成功 (共 {final_count} 条，覆盖 {dedup_stats.get('cluster_count', 0)} 个情景簇)",
+        "dataset_id": dataset_id,
         "file_path": export_path,
-        "sample_count": len(samples),
+        "sample_count": final_count,
+        "dedup_stats": dedup_stats,
     }
 
 @router.delete("/samples/{sample_id}")
@@ -633,8 +767,9 @@ def trigger_sample_remediation(
         }
 
     remed_msgs: List[ChatMessage] = updated_rec.remediated_messages or []
-    remed_dicts: List[Dict[str, Any]] = [m.to_dict() for m in remed_msgs]
+    remed_dicts: List[Dict[str, Any]] = messages_to_dicts(remed_msgs)
     sample.remediated_messages_json = json.dumps(remed_dicts, ensure_ascii=False)
+    _refresh_sample_user_hashes(sample, raw_msgs=raw_msgs, remed_msgs=remed_msgs)
     sample.verified_eval_json = (
         json.dumps(updated_rec.verified_eval.model_dump(), ensure_ascii=False)
         if updated_rec.verified_eval
@@ -721,13 +856,98 @@ def trigger_batch_flywheel(
             gold_out = payload.gold_output_path or os.path.join(settings.DATASETS_DIR, f"{payload.rule_id}_gold.jsonl")
             discard_out = payload.discard_output_path or os.path.join(settings.DATASETS_DIR, f"{payload.rule_id}_discarded.jsonl")
 
+            def _on_record_done(f_rec: FlywheelRecord, _raw_msgs: List[ChatMessage]) -> bool:
+                p_db = SessionLocal()
+                try:
+                    final_score = (
+                        f_rec.verified_eval.score
+                        if f_rec.verified_eval
+                        else (f_rec.initial_eval.score if f_rec.initial_eval else 0)
+                    )
+                    db_row, _ = upsert_flywheel_sample(
+                        p_db,
+                        sample_id=f_rec.id,
+                        source_id=f_rec.id,
+                        task_id=task_id,
+                        rule_id=rule.rule_id,
+                        scenario_id=f_rec.scenario_id,
+                        status=f_rec.status,
+                        score=final_score,
+                        raw_messages=f_rec.raw_messages,
+                        remediated_messages=f_rec.remediated_messages,
+                        applied_actions=f_rec.applied_actions,
+                        benchmark_slices=[s.model_dump() for s in f_rec.benchmark_slices],
+                        remediation_debug=f_rec.remediation_debug or {},
+                        initial_eval=f_rec.initial_eval.model_dump() if f_rec.initial_eval else {},
+                        verified_eval=f_rec.verified_eval.model_dump() if f_rec.verified_eval else {},
+                        reviewer_comment=f"来自批量飞轮治理 ({task_id})",
+                        updated_at=f_rec.updated_at,
+                        commit=True,
+                    )
+                    return bool(db_row.exported_to_benchmark)
+                except Exception as exc:
+                    p_db.rollback()
+                    # 严禁吞错放行！先只读核查同规则下是否存在匹配的留出源样本，查不到或查库异常则直接抛出阻断写盘
+                    raw_hash, remed_hash = FlywheelPipelineService.compute_dialogue_user_hashes(
+                        f_rec.raw_messages, f_rec.remediated_messages
+                    )
+                    hashes: List[str] = [h for h in (raw_hash, remed_hash) if h]
+                    ro_query = p_db.query(FlywheelSampleRecord).filter(
+                        FlywheelSampleRecord.rule_id == rule.rule_id,
+                        FlywheelSampleRecord.exported_to_benchmark == True,  # noqa: E712
+                    )
+                    matched_holdout = ro_query.filter(
+                        FlywheelSampleRecord.id == f_rec.id
+                    ).first()
+                    if matched_holdout is None and hashes:
+                        matched_holdout = ro_query.filter(
+                            FlywheelSampleRecord.raw_user_hash.in_(hashes)
+                            | FlywheelSampleRecord.remediated_user_hash.in_(hashes)
+                        ).first()
+                    if matched_holdout is not None:
+                        print(
+                            f"⚠️ [FlywheelBatch] 样本 {f_rec.id} 写库异常({exc})，只读核查命中留出样本 {matched_holdout.id}，已隔离排除"
+                        )
+                        return True
+                    print(f"❌ [FlywheelBatch] 样本 {f_rec.id} 写库异常且无法核销安全状态，已阻断写入黄金集: {exc}")
+                    raise
+                finally:
+                    p_db.close()
+
             stats = pipeline.batch_process_dataset(
                 rule=rule,
                 input_records=records,
                 gold_output_path=gold_out,
                 discard_output_path=discard_out,
                 workers=payload.workers,
+                on_record_done=_on_record_done,
+                dedup_config=payload.dedup_config,
             )
+
+            # 同步注册黄金训练集至 DatasetRecord（含绝对路径/默认目录）
+            if os.path.exists(gold_out):
+                gold_cnt: int = int(stats.get("final_gold_count") or 0)
+                if gold_cnt > 0:
+                    gold_fname: str = os.path.basename(gold_out)
+                    gold_did: str = gold_fname[:-6] if gold_fname.endswith(".jsonl") else gold_fname
+                    ds_rec = bg_db.query(DatasetRecord).filter(DatasetRecord.id == gold_did).first()
+                    if ds_rec is None:
+                        ds_rec = DatasetRecord(
+                            id=gold_did,
+                            name=gold_fname,
+                            file_path=gold_out,
+                            sample_count=gold_cnt,
+                            dataset_type="flywheel_gold",
+                            created_at=int(time.time()),
+                        )
+                        bg_db.add(ds_rec)
+                    else:
+                        ds_rec.name = gold_fname
+                        ds_rec.file_path = gold_out
+                        ds_rec.sample_count = gold_cnt
+                        ds_rec.dataset_type = "flywheel_gold"
+                        ds_rec.created_at = int(time.time())
+
             task.status = "COMPLETED"
             task.progress = 1.0
             task.result_json = json.dumps(stats, ensure_ascii=False)
@@ -892,30 +1112,22 @@ def inspect_dataset_by_rule(
                             )
                             else "PENDING"
                         )
-                        existing_fw = (
-                            p_db.query(FlywheelSampleRecord)
-                            .filter(FlywheelSampleRecord.id == fw_id)
-                            .first()
+                        upsert_flywheel_sample(
+                            p_db,
+                            sample_id=fw_id,
+                            source_id=str(entry["sample_id"]),
+                            task_id=task_id,
+                            rule_id=rule.rule_id,
+                            scenario_id=str(entry.get("scenario_id") or "default"),
+                            status=fw_status,
+                            score=int(rep.score),
+                            raw_messages=standard_raw,
+                            initial_eval=rep.model_dump(),
+                            reviewer_comment=f"来自数据集规则质检 ({resolved_dataset_id or task_id})",
+                            updated_at=int(time.time()),
+                            commit=False,
                         )
-                        if existing_fw is None:
-                            raw_dicts: List[Dict[str, Any]] = [
-                                {"role": m.role, "content": m.content, **({"thinking": m.thinking} if m.thinking else {})}
-                                for m in standard_raw
-                            ]
-                            fw_rec = FlywheelSampleRecord(
-                                id=fw_id,
-                                task_id=task_id,
-                                rule_id=rule.rule_id,
-                                scenario_id=str(entry.get("scenario_id") or "default"),
-                                status=fw_status,
-                                score=int(rep.score),
-                                raw_messages_json=json.dumps(raw_dicts, ensure_ascii=False),
-                                initial_eval_json=json.dumps(rep.model_dump(), ensure_ascii=False),
-                                reviewer_comment=f"来自数据集规则质检 ({resolved_dataset_id or task_id})",
-                                updated_at=int(time.time()),
-                            )
-                            p_db.add(fw_rec)
-                            saved_count += 1
+                        saved_count += 1
 
                     if t:
                         t.progress = round(completed / max(total, 1), 4)
@@ -1075,6 +1287,7 @@ def update_sample_review(
         sample.status = payload.status
     if payload.remediated_messages is not None:
         sample.remediated_messages_json = json.dumps(payload.remediated_messages, ensure_ascii=False)
+        _refresh_sample_user_hashes(sample, remed_msgs=payload.remediated_messages)
     if payload.reviewer_comment is not None:
         sample.reviewer_comment = payload.reviewer_comment
 
@@ -1090,9 +1303,12 @@ def export_gold_dataset(
     include_manual_approved: bool = True,
     inject_thinking: bool = False,
     exclude_benchmark_exported: bool = True,
+    mode: str = "create",
+    target_dataset_id: Optional[str] = None,
+    payload: Optional[ExportGoldOptionsBody] = Body(default=None),
     db: Session = Depends(get_db),
 ):
-    """从复核池中一键导出符合标准 messages 格式的黄金微调训练集 (.jsonl)，默认排除已进评测集的同源对话"""
+    """从复核池中一键导出符合标准 messages 格式的黄金微调训练集 (.jsonl)，默认排除已进评测集的同源对话并去重防稀释"""
     allowed_statuses = ["GOLD_PASS", "REPAIRED_PASS"]
     if include_manual_approved:
         allowed_statuses.append("MANUAL_APPROVED")
@@ -1111,36 +1327,36 @@ def export_gold_dataset(
     if not samples:
         raise HTTPException(status_code=400, detail="该规则下暂无可导出的达标黄金样本")
 
-    export_fname = f"flywheel_{rule_id}_{version_tag}_gold.jsonl"
-    export_path = os.path.join(settings.DATASETS_DIR, export_fname)
+    eff_mode: str = (payload.mode if payload and payload.mode else mode) or "create"
+    raw_target_id: str = (
+        payload.target_dataset_id
+        if payload and payload.target_dataset_id
+        else (target_dataset_id or "")
+    ).strip()
+    if raw_target_id:
+        dataset_id: str = re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fa5]", "_", raw_target_id)
+        if dataset_id.endswith(".jsonl"):
+            dataset_id = dataset_id[:-6]
+    else:
+        dataset_id = f"flywheel_{rule_id}_{version_tag}_gold"
+    export_path = os.path.join(settings.DATASETS_DIR, f"{dataset_id}.jsonl")
 
-    with open(export_path, "w", encoding="utf-8") as f:
-        for s in samples:
-            msgs = json.loads(s.remediated_messages_json or s.raw_messages_json or "[]")
-            clean_msgs = []
-            for m in msgs:
-                entry = {"role": m.get("role"), "content": m.get("content")}
-                if inject_thinking and entry["role"] == "assistant":
-                    entry["thinking"] = m.get("thinking", "")
-                clean_msgs.append(entry)
-
-            row = {
-                "id": s.id,
-                "metadata": {
-                    "rule_id": s.rule_id,
-                    "scenario_id": s.scenario_id,
-                    "status": s.status,
-                    "score": s.score,
-                    "reviewer_comment": s.reviewer_comment,
-                },
-                "messages": clean_msgs,
-            }
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    final_count, dedup_stats = _export_training_rows_to_dataset(
+        db=db,
+        samples=samples,
+        export_path=export_path,
+        dataset_id=dataset_id,
+        inject_thinking=inject_thinking,
+        mode=eff_mode,
+        dedup_config=payload.dedup_config if payload else None,
+    )
 
     return {
-        "message": "黄金微调数据集导出成功",
+        "message": f"黄金微调数据集导出成功 (共 {final_count} 条，覆盖 {dedup_stats.get('cluster_count', 0)} 个情景簇)",
+        "dataset_id": dataset_id,
         "file_path": export_path,
-        "sample_count": len(samples),
+        "sample_count": final_count,
+        "dedup_stats": dedup_stats,
     }
 
 
@@ -1179,6 +1395,8 @@ def _ensure_db_sample_slices(
         rule=rule,
         scenario_id=sample.scenario_id,
         remediated_messages=remed_msgs,
+        trajectory_details=initial_eval.get("trajectory_details"),
+        faq_details=initial_eval.get("faq_details"),
     )
     if generated:
         sample.benchmark_slices_json = json.dumps(slices_data, ensure_ascii=False)
@@ -1188,10 +1406,25 @@ def _ensure_db_sample_slices(
 def _build_benchmark_rows_from_slices(
     sample_id: str,
     slices: List[Dict[str, Any]],
+    rule_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """将飞轮评测切片字典列表转换为标准 Benchmark JSONL 行格式。"""
-    return [
-        {
+    """将飞轮评测切片字典列表转换为标准 Benchmark JSONL 行格式（保留定位元数据）。"""
+    rows: List[Dict[str, Any]] = []
+    for sl in slices:
+        meta: Dict[str, Any] = {"source_sample_id": sample_id}
+        eff_rule: Optional[str] = sl.get("rule_id") or rule_id
+        if eff_rule:
+            meta["rule_id"] = eff_rule
+        if sl.get("node_id"):
+            meta["node_id"] = sl["node_id"]
+        if sl.get("faq_id"):
+            meta["faq_id"] = sl["faq_id"]
+        if sl.get("is_faq_ood"):
+            meta["is_faq_ood"] = True
+        if sl.get("target_turn") is not None:
+            meta["target_turn"] = sl["target_turn"]
+
+        rows.append({
             "id": sl["slice_id"],
             "category": sl.get("category") or "飞轮实战质检",
             "sub_category": sl.get("sub_category") or sl.get("defect_item"),
@@ -1202,9 +1435,9 @@ def _build_benchmark_rows_from_slices(
             "reference": sl["reference"],
             "rubric": sl["rubric"],
             "regex_constraints": sl.get("regex_constraints", []),
-        }
-        for sl in slices
-    ]
+            "metadata": meta,
+        })
+    return rows
 
 
 def _write_and_register_benchmark_dataset(
@@ -1214,32 +1447,55 @@ def _write_and_register_benchmark_dataset(
     mode: str,
     bench_rows: List[Dict[str, Any]],
     exported_samples: List[FlywheelSampleRecord],
-) -> Tuple[str, int]:
-    """合并写入 Benchmark JSONL 文件、注册 DatasetRecord、锁定防泄漏标记并按需重置抽样账本。"""
+    dedup_config: Optional[DedupConfig] = None,
+) -> Tuple[str, int, Dict[str, Any]]:
+    """合并写入 Benchmark JSONL 文件（接入四步去重防稀释）、注册 DatasetRecord 并精准锁定留出源样本。"""
     file_path = os.path.join(settings.DATASETS_DIR, f"{dataset_id}.jsonl")
 
-    existing_rows_map: Dict[str, Dict[str, Any]] = {}
+    existing_rows: Optional[List[Dict[str, Any]]] = None
     if mode == "append" and os.path.exists(file_path):
+        loaded: List[Dict[str, Any]] = []
         with open(file_path, "r", encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if line:
+                s_line = line.strip()
+                if s_line:
                     try:
-                        d = json.loads(line)
-                        if "id" in d:
-                            existing_rows_map[d["id"]] = d
+                        d = json.loads(s_line)
+                        if isinstance(d, dict):
+                            loaded.append(d)
                     except Exception:
                         pass
+        existing_rows = loaded
 
-    for r in bench_rows:
-        existing_rows_map[r["id"]] = r
-
-    final_rows = list(existing_rows_map.values()) if existing_rows_map else bench_rows
+    final_rows, dedup_stats = FlywheelPipelineService.deduplicate_benchmark_export(
+        candidate_rows=bench_rows,
+        existing_rows=existing_rows,
+        config=dedup_config,
+        dataset_file_path=file_path,
+    )
 
     os.makedirs(settings.DATASETS_DIR, exist_ok=True)
-    with open(file_path, "w", encoding="utf-8") as f:
-        for r in final_rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    tmp_path: str = f"{file_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for r in final_rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, file_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise
+
+    if mode == "create" and not bool(dedup_stats.get("enabled")):
+        stale_cache = FlywheelPipelineService.get_dedup_cache_path(file_path)
+        if os.path.exists(stale_cache):
+            try:
+                os.remove(stale_cache)
+            except Exception:
+                pass
 
     ds_record = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
     if not ds_record:
@@ -1257,18 +1513,41 @@ def _write_and_register_benchmark_dataset(
         ds_record.sample_count = len(final_rows)
         ds_record.dataset_type = "benchmark"
 
-    # 源头互斥锁定: 仅在文件落盘成功后，标记源样本已进入纯评测留出池
+    # 源头互斥锁定: 仅对最终保留至少 1 道评测题的源样本置位 exported_to_benchmark = True
+    retained_sources: Set[str] = set()
+    retained_ids: Set[str] = set()
+    for r in final_rows:
+        if r.get("id"):
+            retained_ids.add(str(r["id"]))
+        src = r.get("source")
+        if isinstance(src, str) and src.startswith("flywheel_"):
+            retained_sources.add(src[len("flywheel_") :])
+        r_meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        if r_meta.get("source_sample_id"):
+            retained_sources.add(str(r_meta["source_sample_id"]))
+
     now_ts = int(time.time())
     for s in exported_samples:
-        s.exported_to_benchmark = True
-        s.updated_at = now_ts
+        has_slice_kept = s.id in retained_sources
+        if not has_slice_kept:
+            try:
+                s_slices = json.loads(s.benchmark_slices_json or "[]")
+                has_slice_kept = any(
+                    isinstance(sl, dict) and str(sl.get("slice_id") or "") in retained_ids
+                    for sl in s_slices
+                )
+            except Exception:
+                has_slice_kept = False
+        if has_slice_kept:
+            s.exported_to_benchmark = True
+            s.updated_at = now_ts
 
     db.commit()
 
     if mode == "create":
         BenchmarkSamplingEngine.reset_trackers_in_db(db=db, dataset_path=file_path)
 
-    return file_path, len(final_rows)
+    return file_path, len(final_rows), dedup_stats
 
 
 @router.get("/samples/{sample_id}/slices")
@@ -1318,8 +1597,9 @@ def update_sample_slices(sample_id: str, payload: UpdateBenchmarkSlicesRequest, 
         if updated_actions:
             sample.applied_actions_json = json.dumps(updated_actions, ensure_ascii=False)
         if sanitized_msgs is not None:
-            sanitized_dicts: List[Dict[str, Any]] = [m.to_dict() for m in sanitized_msgs]
+            sanitized_dicts: List[Dict[str, Any]] = messages_to_dicts(sanitized_msgs)
             sample.remediated_messages_json = json.dumps(sanitized_dicts, ensure_ascii=False)
+            _refresh_sample_user_hashes(sample, raw_msgs=raw_msgs, remed_msgs=sanitized_msgs)
 
     sample.updated_at = int(time.time())
     db.commit()
@@ -1354,15 +1634,16 @@ def export_single_sample_benchmark(
 
     dataset_id = payload.dataset_id.strip() or f"flywheel_{sample_id}_eval"
     dataset_name = payload.name.strip() or f"飞轮样本评测集 ({sample_id})"
-    bench_rows = _build_benchmark_rows_from_slices(sample_id, selected_slices)
+    bench_rows = _build_benchmark_rows_from_slices(sample_id, selected_slices, rule_id=sample.rule_id)
 
-    file_path, sample_count = _write_and_register_benchmark_dataset(
+    file_path, sample_count, dedup_stats = _write_and_register_benchmark_dataset(
         db=db,
         dataset_id=dataset_id,
         dataset_name=dataset_name,
         mode=payload.mode,
         bench_rows=bench_rows,
         exported_samples=[sample],
+        dedup_config=payload.dedup_config,
     )
 
     return {
@@ -1370,6 +1651,7 @@ def export_single_sample_benchmark(
         "dataset_id": dataset_id,
         "file_path": file_path,
         "sample_count": sample_count,
+        "dedup_stats": dedup_stats,
     }
 
 
@@ -1400,19 +1682,20 @@ def batch_export_benchmark_dataset(
             if payload.strategy == "primary_defect_only"
             else slices_raw
         )
-        all_bench_rows.extend(_build_benchmark_rows_from_slices(s.id, target_slices))
+        all_bench_rows.extend(_build_benchmark_rows_from_slices(s.id, target_slices, rule_id=s.rule_id))
         exported_samples.append(s)
 
     if not all_bench_rows:
         raise HTTPException(status_code=400, detail="所选样本中未生成任何有效评测切片")
 
-    file_path, sample_count = _write_and_register_benchmark_dataset(
+    file_path, sample_count, dedup_stats = _write_and_register_benchmark_dataset(
         db=db,
         dataset_id=dataset_id,
         dataset_name=dataset_name,
         mode=payload.mode,
         bench_rows=all_bench_rows,
         exported_samples=exported_samples,
+        dedup_config=payload.dedup_config,
     )
 
     return {
@@ -1420,4 +1703,5 @@ def batch_export_benchmark_dataset(
         "dataset_id": dataset_id,
         "file_path": file_path,
         "sample_count": sample_count,
+        "dedup_stats": dedup_stats,
     }

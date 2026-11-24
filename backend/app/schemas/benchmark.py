@@ -5,6 +5,7 @@
 from typing import List, Dict, Any, Optional, Literal, Union
 from pydantic import BaseModel, Field
 from backend.app.schemas.chat import ChatMessage, ModelConfig, UnifiedChatResponse
+from backend.app.schemas.flywheel import DedupConfig
 
 
 class SampleEvalTracker(BaseModel):
@@ -118,6 +119,7 @@ class BenchmarkExportFilterRequest(BaseModel):
     target_dataset_id: Optional[str] = Field(None, description="另存为新评测集时的目标 ID")
     target_dataset_name: Optional[str] = Field(None, description="另存为新评测集时的显示名称")
     save_mode: Literal["overwrite", "append"] = Field("overwrite", description="另存为新评测集时的写入模式")
+    dedup_config: Optional[DedupConfig] = Field(None, description="可选去重防稀释配置")
 
 
 class BenchmarkExportPreviewResponse(BaseModel):
@@ -163,6 +165,7 @@ class BenchmarkSample(BaseModel):
     rubric: Optional[Union[str, RubricConfig]] = None
     regex_constraints: List[str] = Field(default_factory=list)
     eval_tracker: Optional[SampleEvalTracker] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class ModelEvalConfig(BaseModel):

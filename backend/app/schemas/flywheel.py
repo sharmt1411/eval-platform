@@ -7,6 +7,23 @@ from pydantic import BaseModel, Field
 from backend.app.schemas.chat import ChatMessage
 
 
+class DedupConfig(BaseModel):
+    """数据集去重与防稀释配置"""
+    enabled: bool = True
+    cluster_quota: Optional[int] = Field(
+        default=None, ge=1, description="单簇保留上限 K (评测集默认 5，训练集默认 20)"
+    )
+    answer_sim_threshold: float = Field(
+        default=0.82, ge=0.0, le=1.0, description="Step 2b 未细分池按坐席答案/回复向量拆簇余弦相似度阈值"
+    )
+    near_dup_input_threshold: float = Field(
+        default=0.90, ge=0.0, le=1.0, description="追加合并外部无标签数据时，客户输入近似重复拦截阈值"
+    )
+    target_total_count: Optional[int] = Field(
+        default=None, ge=1, description="可选目标总条数，未满时从余量池按客户输入差异最大化补足"
+    )
+
+
 class InspectionReport(BaseModel):
     score: int
     verdict: Literal["PASS", "FAIL"]
@@ -14,6 +31,7 @@ class InspectionReport(BaseModel):
     deductions: List[Dict[str, Any]] = Field(default_factory=list)  # 扣分明细与依据说明 [{item, points, reason}]
     node_trajectory: List[str] = Field(default_factory=list)
     trajectory_details: List[Dict[str, Any]] = Field(default_factory=list)
+    faq_details: List[Dict[str, Any]] = Field(default_factory=list)
     topology_valid: bool = True
     topology_error: Optional[str] = None
     flow_checkpoints: Dict[str, Any] = Field(default_factory=dict)
@@ -36,6 +54,10 @@ class FlywheelBenchmarkSlice(BaseModel):
     regex_constraints: List[str] = Field(default_factory=list) # 正反向正则 (支持自动继承与人工微调)
     category: Optional[str] = "飞轮实战质检" # 考题分类
     sub_category: Optional[str] = None     # 子分类 (如节点ID)
+    rule_id: Optional[str] = None          # 来源业务规则 ID
+    node_id: Optional[str] = None          # 对应 SOP 节点 ID
+    faq_id: Optional[str] = None           # 对应知识库 FAQ ID（超纲为 FAQ_OOD）
+    is_faq_ood: bool = False               # 是否为超纲 FAQ 提问
 
 
 class FlywheelRecord(BaseModel):
@@ -70,13 +92,13 @@ class SimulationRunRequest(BaseModel):
 
 
 class BatchUpdateStatusRequest(BaseModel):
-    sample_ids: List[str]
+    sample_ids: List[str] = Field(..., min_length=1)
     status: Literal["PENDING", "GOLD_PASS", "REPAIRED_PASS", "DISCARDED", "MANUAL_APPROVED"]
     reviewer_comment: Optional[str] = None
 
 
 class BatchDeleteSamplesRequest(BaseModel):
-    sample_ids: List[str]
+    sample_ids: List[str] = Field(..., min_length=1)
 
 
 class BatchRemediateRequest(BaseModel):
@@ -111,9 +133,13 @@ class SingleRemediateRequest(BaseModel):
 
 
 class BatchExportSelectedRequest(BaseModel):
-    sample_ids: List[str]
-    version_tag: str = "v1"
+    sample_ids: List[str] = Field(..., min_length=1)
+    version_tag: str = "v1.0"
     inject_thinking: bool = False
+    exclude_benchmark_exported: bool = True
+    mode: Literal["create", "append"] = "create"
+    target_dataset_id: Optional[str] = None
+    dedup_config: Optional[DedupConfig] = None
 
 
 class UpdateBenchmarkSlicesRequest(BaseModel):
@@ -126,6 +152,7 @@ class ExportBenchmarkDatasetRequest(BaseModel):
     name: str
     slice_ids: Optional[List[str]] = None
     mode: Literal["create", "append"] = "create"
+    dedup_config: Optional[DedupConfig] = None
 
 
 class BatchExportBenchmarkRequest(BaseModel):
@@ -134,6 +161,7 @@ class BatchExportBenchmarkRequest(BaseModel):
     name: str
     mode: Literal["create", "append"] = "create"
     strategy: Literal["all_defects", "primary_defect_only"] = "all_defects"
+    dedup_config: Optional[DedupConfig] = None
 
 
 class BatchFlywheelRunRequest(BaseModel):
@@ -143,6 +171,8 @@ class BatchFlywheelRunRequest(BaseModel):
     input_file_path: str
     gold_output_path: Optional[str] = None
     discard_output_path: Optional[str] = None
+    workers: int = 4
+    dedup_config: Optional[DedupConfig] = None
 
 
 class DatasetInspectRequest(BaseModel):

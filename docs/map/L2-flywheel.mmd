@@ -15,6 +15,7 @@ flowchart TB
   end
 
   slicer["渐进切题引擎\nbackend/app/engine/slicer.py:ProgressiveContextSlicer"]
+  deduplicator["去重防稀释引擎\nbackend/app/engine/deduplicator.py:DatasetDeduplicator"]
   judge_engine["质检裁判引擎\nbackend/app/engine/judge.py:UniversalJudgeEngine"]
   prompt_registry["提示词注册底座\nbackend/app/engine/prompt_registry.py"]
   adapters["统一模型接入底座\nbackend/app/adapters"]
@@ -26,6 +27,7 @@ flowchart TB
   flywheel_service -->|"初检/二检/只检不修"| judge_engine
   flywheel_service -->|"AI修复/重放校验"| remediator
   flywheel_service -->|"生成/补切评测切片"| slicer
+  flywheel_service -->|"四步去重防稀释与缓存"| deduplicator
   slicer -->|"格式清洗校验"| remediator
   remediator -->|"读取激活修复模板"| prompt_registry
   prompt_registry -->|"读取PromptTemplateRecord"| sqlite_db

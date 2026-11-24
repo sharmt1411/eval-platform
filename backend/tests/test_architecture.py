@@ -100,6 +100,7 @@ def test_router_to_service_encapsulation_boundaries():
         "engine.faq_retriever",
         "engine.simulator",
         "engine.benchmark_runner",
+        "engine.deduplicator",
     }
     flywheel_skips = sorted(flywheel_deps & forbidden_flywheel_deps)
     assert not flywheel_skips, f"api.flywheel 不得绕过服务层或 deps 直连底层模块: {flywheel_skips}"
@@ -114,6 +115,7 @@ def test_router_to_service_encapsulation_boundaries():
         "engine.faq_retriever",
         "engine.benchmark_runner",
         "engine.benchmark_sampler",
+        "engine.deduplicator",
     }
     sim_skips = sorted(sim_deps & forbidden_sim_deps)
     assert not sim_skips, f"api.simulation 不得绕过服务层或 deps 直连底层模块: {sim_skips}"

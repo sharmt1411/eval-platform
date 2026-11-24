@@ -55,12 +55,81 @@ import type {
   FlywheelStatus,
   ChatMessage,
   FlywheelBenchmarkSlice,
+  DedupConfig,
+  DedupStats,
 } from '../types';
 
 const { Text } = Typography;
 
 const FLYWHEEL_LAST_JUDGE_MODEL_KEY = 'eval_platform_flywheel_last_judge_model_id';
 const FLYWHEEL_LAST_REMEDIATE_MODEL_KEY = 'eval_platform_flywheel_last_remediate_model_id';
+
+const buildDedupConfigFromForm = (values: any, defaultQuota: number): DedupConfig => ({
+  enabled: values.dedup_enabled ?? true,
+  cluster_quota:
+    values.dedup_cluster_quota && Number(values.dedup_cluster_quota) > 0
+      ? Number(values.dedup_cluster_quota)
+      : defaultQuota,
+  answer_sim_threshold:
+    values.dedup_answer_sim_threshold !== undefined &&
+    values.dedup_answer_sim_threshold !== null
+      ? Number(values.dedup_answer_sim_threshold)
+      : 0.82,
+  target_total_count:
+    values.dedup_target_total_count && Number(values.dedup_target_total_count) > 0
+      ? Number(values.dedup_target_total_count)
+      : null,
+});
+
+const formatDedupSuffix = (stats?: DedupStats): string => {
+  if (!stats?.enabled) return '';
+  const dropped =
+    (stats.exact_hash_dropped || 0) +
+    (stats.near_dup_dropped || 0) +
+    (stats.quota_dropped || 0);
+  const clusters = stats.cluster_count || 0;
+  return `（覆盖 ${clusters} 个簇，去重防稀释过滤 ${dropped} 条）`;
+};
+
+const renderDedupFields = (
+  defaultQuota: number,
+  defaultEnabled = true,
+  title = '去重与防稀释配置（客户序列哈希 + 轨迹/场景防超限配额）'
+) => (
+  <div className="bg-slate-50 border border-slate-200 rounded-md p-3 mb-3 space-y-2">
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-xs font-semibold text-slate-800">{title}</span>
+      <Form.Item name="dedup_enabled" valuePropName="checked" initialValue={defaultEnabled} className="m-0">
+        <Switch checkedChildren="开启去重" unCheckedChildren="关闭去重" />
+      </Form.Item>
+    </div>
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+      <Form.Item
+        name="dedup_cluster_quota"
+        label={<span className="text-3xs text-slate-600">单簇保留上限 K</span>}
+        initialValue={defaultQuota}
+        className="m-0"
+      >
+        <InputNumber size="small" min={1} max={1000} className="w-full" />
+      </Form.Item>
+      <Form.Item
+        name="dedup_answer_sim_threshold"
+        label={<span className="text-3xs text-slate-600">同答拆簇阈值 θ</span>}
+        initialValue={0.82}
+        className="m-0"
+      >
+        <InputNumber size="small" min={0} max={1} step={0.02} className="w-full" />
+      </Form.Item>
+      <Form.Item
+        name="dedup_target_total_count"
+        label={<span className="text-3xs text-slate-600">目标总条数 (可选补足)</span>}
+        className="m-0"
+      >
+        <InputNumber size="small" min={1} placeholder="不限" className="w-full" />
+      </Form.Item>
+    </div>
+  </div>
+);
 
 export const FlywheelWorkbench: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -355,9 +424,19 @@ export const FlywheelWorkbench: React.FC = () => {
         dataset_id: values.dataset_id,
         name: values.name,
         mode: values.mode,
+        dedup_config: buildDedupConfigFromForm(values, 5),
       });
-      message.success(`评测集 [${res.dataset_id}] 导出成功，共 ${res.sample_count} 道切题，已在数据资产中心注册！`);
+      const keptSliceCount = res.dedup_stats?.enabled
+        ? (res.dedup_stats.kept_candidates || 0) + (res.dedup_stats.replaced_existing_count || 0)
+        : res.sample_count;
+      message.success(
+        `评测集 [${res.dataset_id}] 导出成功，共 ${res.sample_count} 道切题${formatDedupSuffix(res.dedup_stats)}，已在数据资产中心注册！`
+      );
       setExportSingleBenchmarkVisible(false);
+      if (keptSliceCount > 0) {
+        setCurrentSample((prev) => (prev ? { ...prev, exported_to_benchmark: true } : prev));
+      }
+      loadData();
     } catch (e: any) {
       if (e.errorFields) return;
       message.error(`导出评测集失败: ${e.response?.data?.detail || e.message}`);
@@ -368,16 +447,21 @@ export const FlywheelWorkbench: React.FC = () => {
     try {
       const values = await batchExportBenchmarkForm.validateFields();
       setBatchActionLoading(true);
+      const selectedIds = selectedRowKeys as string[];
       const res = await flywheelApi.batchExportBenchmark({
-        sample_ids: selectedRowKeys as string[],
+        sample_ids: selectedIds,
         dataset_id: values.dataset_id,
         name: values.name,
         mode: values.mode,
         strategy: values.strategy,
+        dedup_config: buildDedupConfigFromForm(values, 5),
       });
-      message.success(`批量导出成功！共导出 ${res.sample_count} 道考题至基准评测集 [${res.dataset_id}]`);
+      message.success(
+        `批量导出成功！共导出 ${res.sample_count} 道考题至基准评测集 [${res.dataset_id}]${formatDedupSuffix(res.dedup_stats)}`
+      );
       setBatchExportBenchmarkModalVisible(false);
       setSelectedRowKeys([]);
+      loadData();
     } catch (e: any) {
       if (e.errorFields) return;
       message.error(`批量导出失败: ${e.response?.data?.detail || e.message}`);
@@ -639,11 +723,16 @@ export const FlywheelWorkbench: React.FC = () => {
         include_manual_approved: values.include_manual_approved ?? true,
         inject_thinking: values.inject_thinking ?? false,
         exclude_benchmark_exported: values.exclude_benchmark_exported ?? true,
+        mode: values.mode || 'create',
+        target_dataset_id: values.target_dataset_id?.trim() || undefined,
+        dedup_config: buildDedupConfigFromForm(values, 20),
       });
-      message.success(`成功导出 ${res.sample_count} 条达标黄金语料至 ${res.file_path}`);
+      message.success(
+        `成功导出 ${res.sample_count} 条达标黄金语料至 ${res.file_path}${formatDedupSuffix(res.dedup_stats)}`
+      );
       setExportModalVisible(false);
     } catch (e: any) {
-      message.error(`导出失败: ${e.message}`);
+      message.error(`导出失败: ${e.response?.data?.detail || e.message}`);
     } finally {
       setExportLoading(false);
     }
@@ -659,6 +748,7 @@ export const FlywheelWorkbench: React.FC = () => {
         judge_model_id: values.judge_model_id,
         remediate_model_id: values.remediate_model_id || undefined,
         workers: values.workers || 4,
+        dedup_config: buildDedupConfigFromForm(values, 20),
       });
       message.success('存量数据集批量飞轮治理任务已提交');
       setBatchModalVisible(false);
@@ -830,6 +920,11 @@ export const FlywheelWorkbench: React.FC = () => {
     batchExportSelectedForm.setFieldsValue({
       version_tag: 'selected-v1.0',
       inject_thinking: false,
+      exclude_benchmark_exported: true,
+      mode: 'create',
+      dedup_enabled: true,
+      dedup_cluster_quota: 20,
+      dedup_answer_sim_threshold: 0.82,
     });
     setBatchExportSelectedModalVisible(true);
   };
@@ -843,12 +938,18 @@ export const FlywheelWorkbench: React.FC = () => {
         sample_ids: selectedRowKeys as string[],
         version_tag: values.version_tag || 'selected',
         inject_thinking: values.inject_thinking ?? false,
+        exclude_benchmark_exported: values.exclude_benchmark_exported ?? true,
+        mode: values.mode || 'create',
+        target_dataset_id: values.target_dataset_id?.trim() || undefined,
+        dedup_config: buildDedupConfigFromForm(values, 20),
       });
-      message.success(`成功导出 ${res.sample_count} 条选中样本至: ${res.file_path}`);
+      message.success(
+        `成功导出 ${res.sample_count} 条选中样本至: ${res.file_path}${formatDedupSuffix(res.dedup_stats)}`
+      );
       setBatchExportSelectedModalVisible(false);
       setSelectedRowKeys([]);
     } catch (e: any) {
-      message.error(`批量导出失败: ${e.message}`);
+      message.error(`批量导出失败: ${e.response?.data?.detail || e.message}`);
     } finally {
       setBatchActionLoading(false);
     }
@@ -1376,15 +1477,36 @@ export const FlywheelWorkbench: React.FC = () => {
         onCancel={() => setBatchExportSelectedModalVisible(false)}
         okText="立即导出"
         cancelText="取消"
+        width={600}
       >
         <div className="py-2">
           <Form form={batchExportSelectedForm} layout="vertical">
-            <Form.Item name="version_tag" label="数据集版本标识" initialValue="selected-v1.0" rules={[{ required: true }]}>
-              <Input placeholder="例如 selected-v1.0 或 batch-exp-v1" />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <Form.Item name="version_tag" label="数据集版本标识" initialValue="selected-v1.0" rules={[{ required: true }]}>
+                <Input placeholder="例如 selected-v1.0 或 batch-exp-v1" />
+              </Form.Item>
+              <Form.Item name="target_dataset_id" label="自定义目标数据集 ID (可选)">
+                <Input placeholder="留空则按 version_tag 自动生成" />
+              </Form.Item>
+            </div>
+            <Form.Item name="mode" label="写入模式" initialValue="create">
+              <Radio.Group>
+                <Radio value="create">覆盖创建新数据集</Radio>
+                <Radio value="append">追加合并至现有数据集</Radio>
+              </Radio.Group>
             </Form.Item>
             <Form.Item name="inject_thinking" label="保留思考链 (Thinking Mode)" valuePropName="checked" initialValue={false}>
               <Switch />
             </Form.Item>
+            <Form.Item
+              name="exclude_benchmark_exported"
+              label="源头互斥：排除已导出至评测集的留出同源对话"
+              valuePropName="checked"
+              initialValue={true}
+            >
+              <Switch checkedChildren="默认排除" unCheckedChildren="允许导出" />
+            </Form.Item>
+            {renderDedupFields(20, true)}
           </Form>
         </div>
       </Modal>
@@ -1860,6 +1982,8 @@ export const FlywheelWorkbench: React.FC = () => {
           <Form.Item name="workers" label="并发质检 Worker 数量" initialValue={4}>
             <InputNumber min={1} max={16} />
           </Form.Item>
+
+          {renderDedupFields(20, true)}
         </Form>
       </Modal>
 
@@ -2058,8 +2182,20 @@ export const FlywheelWorkbench: React.FC = () => {
             <Select popupMatchSelectWidth={false} options={rules.map((r) => ({ value: r.rule_id, label: r.project_name }))} />
           </Form.Item>
 
-          <Form.Item name="version_tag" label="训练集版本标签" initialValue="v1.0" rules={[{ required: true }]}>
-            <Input placeholder="如 v1.0, v2.1-dpo" />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Form.Item name="version_tag" label="训练集版本标签" initialValue="v1.0" rules={[{ required: true }]}>
+              <Input placeholder="如 v1.0, v2.1-dpo" />
+            </Form.Item>
+            <Form.Item name="target_dataset_id" label="自定义目标数据集 ID (可选)">
+              <Input placeholder="留空则按规则与版本自动生成" />
+            </Form.Item>
+          </div>
+
+          <Form.Item name="mode" label="写入模式" initialValue="create">
+            <Radio.Group>
+              <Radio value="create">覆盖创建新数据集</Radio>
+              <Radio value="append">追加合并至现有数据集</Radio>
+            </Radio.Group>
           </Form.Item>
 
           <Form.Item name="include_manual_approved" label="包含人工放行样本 (MANUAL_APPROVED)" valuePropName="checked" initialValue={true}>
@@ -2079,6 +2215,8 @@ export const FlywheelWorkbench: React.FC = () => {
           >
             <Switch checkedChildren="默认排除" unCheckedChildren="允许导出" />
           </Form.Item>
+
+          {renderDedupFields(20, true)}
         </Form>
       </Modal>
 
@@ -2090,6 +2228,7 @@ export const FlywheelWorkbench: React.FC = () => {
         onCancel={() => setExportSingleBenchmarkVisible(false)}
         okText="确认保存并注册"
         cancelText="取消"
+        width={600}
       >
         <Form form={singleExportForm} layout="vertical" className="mt-3">
           <Form.Item
@@ -2115,9 +2254,11 @@ export const FlywheelWorkbench: React.FC = () => {
           <Form.Item name="mode" label="写入模式" rules={[{ required: true }]} initialValue="create">
             <Radio.Group>
               <Radio value="create">覆盖创建新评测集</Radio>
-              <Radio value="append">追加至现有同名评测集 (按切片ID去重)</Radio>
+              <Radio value="append">追加至现有同名评测集 (序列哈希与簇配额去重)</Radio>
             </Radio.Group>
           </Form.Item>
+
+          {renderDedupFields(5, true)}
         </Form>
       </Modal>
 
@@ -2181,9 +2322,11 @@ export const FlywheelWorkbench: React.FC = () => {
             <Form.Item name="mode" label="写入模式" rules={[{ required: true }]} initialValue="create">
               <Radio.Group>
                 <Radio value="create">覆盖创建新文件</Radio>
-                <Radio value="append">追加至现有同名评测集 (按切片ID去重更新)</Radio>
+                <Radio value="append">追加至现有同名评测集 (序列哈希与簇配额去重)</Radio>
               </Radio.Group>
             </Form.Item>
+
+            {renderDedupFields(5, true)}
           </Form>
         </div>
       </Modal>

@@ -20,6 +20,8 @@ from backend.app.schemas.flywheel import InspectionReport, FlywheelRecord
 from backend.app.api.deps import (
     get_adapter_and_config_by_model_id,
     load_rule_schema,
+    messages_to_dicts,
+    upsert_flywheel_sample,
 )
 from backend.app.services.simulation_service import SimulationService
 from backend.app.services.flywheel_service import FlywheelPipelineService
@@ -46,56 +48,41 @@ def _persist_flywheel_record(
     record: FlywheelRecord,
     reviewer_comment: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """将 FlywheelPipelineService 产出的 FlywheelRecord 持久化至 SQLite 并返回对弈展示载荷。"""
+    """将 FlywheelPipelineService 产出的 FlywheelRecord 经 Upsert 持久化至 SQLite 并返回对弈展示载荷。"""
     final_score = (
         record.verified_eval.score
         if record.verified_eval
         else (record.initial_eval.score if record.initial_eval else 0)
     )
-    raw_dicts: List[Dict[str, Any]] = [m.to_dict() for m in record.raw_messages]
     remediated_dicts: Optional[List[Dict[str, Any]]] = (
-        [m.to_dict() for m in record.remediated_messages]
+        messages_to_dicts(record.remediated_messages)
         if record.remediated_messages
         else None
     )
-    dialogue_dicts: List[Dict[str, Any]] = [m.to_dict() for m in raw_dialogue]
+    dialogue_dicts: List[Dict[str, Any]] = messages_to_dicts(raw_dialogue)
 
-    db_row = FlywheelSampleRecord(
-        id=record.id,
+    db_row, _ = upsert_flywheel_sample(
+        db,
+        sample_id=record.id,
         task_id=task_id,
         rule_id=rule_id,
         scenario_id=scenario.id,
         status=record.status,
         score=final_score,
-        raw_messages_json=json.dumps(raw_dicts, ensure_ascii=False),
-        remediated_messages_json=(
-            json.dumps(remediated_dicts, ensure_ascii=False)
-            if remediated_dicts is not None
-            else None
-        ),
-        applied_actions_json=json.dumps(record.applied_actions, ensure_ascii=False),
-        benchmark_slices_json=json.dumps(
-            [s.model_dump() for s in record.benchmark_slices], ensure_ascii=False
-        ),
-        remediation_debug_json=json.dumps(record.remediation_debug or {}, ensure_ascii=False),
-        initial_eval_json=(
-            json.dumps(record.initial_eval.model_dump(), ensure_ascii=False)
-            if record.initial_eval
-            else "{}"
-        ),
-        verified_eval_json=(
-            json.dumps(record.verified_eval.model_dump(), ensure_ascii=False)
-            if record.verified_eval
-            else "{}"
-        ),
+        raw_messages=record.raw_messages,
+        remediated_messages=record.remediated_messages,
+        applied_actions=record.applied_actions,
+        benchmark_slices=[s.model_dump() for s in record.benchmark_slices],
+        remediation_debug=record.remediation_debug or {},
+        initial_eval=record.initial_eval.model_dump() if record.initial_eval else {},
+        verified_eval=record.verified_eval.model_dump() if record.verified_eval else {},
         reviewer_comment=reviewer_comment,
         updated_at=record.updated_at,
+        commit=True,
     )
-    db.add(db_row)
-    db.commit()
 
     return {
-        "sample_id": record.id,
+        "sample_id": db_row.id,
         "scenario_id": scenario.id,
         "scenario_name": scenario.name,
         "status": record.status,
@@ -417,7 +404,7 @@ def evaluate_dialogue_endpoint(
             auto_remediate=False,
         )
         sample_status = record.status
-        _persist_flywheel_record(
+        persisted_payload = _persist_flywheel_record(
             db=db,
             task_id="manual_test",
             rule_id=rule.rule_id,
@@ -427,6 +414,7 @@ def evaluate_dialogue_endpoint(
             record=record,
             reviewer_comment="人工自由对话实战质检测试",
         )
+        sample_id = persisted_payload["sample_id"]
 
     return {
         "status": "SUCCESS",

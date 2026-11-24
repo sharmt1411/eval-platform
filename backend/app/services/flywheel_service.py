@@ -18,11 +18,13 @@ from typing import List, Dict, Any, Optional, Set, Tuple, Callable
 from backend.app.schemas.chat import ChatMessage, ModelConfig
 from backend.app.schemas.rule import UniversalRuleSchema, PersonaDefinition
 from backend.app.schemas.flywheel import (
+    DedupConfig,
     InspectionReport,
     FlywheelRecord,
     FlywheelBenchmarkSlice,
 )
 from backend.app.adapters.base import BaseModelAdapter
+from backend.app.engine.deduplicator import DatasetDeduplicator
 from backend.app.engine.judge import UniversalJudgeEngine
 from backend.app.engine.remediator import UniversalDataRemediator
 from backend.app.engine.slicer import ProgressiveContextSlicer
@@ -167,6 +169,106 @@ class FlywheelPipelineService:
         return self.judge_engine.evaluate_dialogue(rule, scenario, dialogue)
 
     @staticmethod
+    def _messages_to_dicts(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for msg in messages:
+            d: Dict[str, Any] = {"role": msg.role, "content": msg.content}
+            if msg.thinking:
+                d["thinking"] = msg.thinking
+            out.append(d)
+        return out
+
+    @staticmethod
+    def compute_dialogue_user_hashes(
+        raw_messages: List[Any],
+        remediated_messages: Optional[List[Any]] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """计算原对话与修复后对话的客户输入序列双哈希。"""
+        return DatasetDeduplicator.compute_dialogue_user_hashes(
+            raw_messages=raw_messages,
+            remediated_messages=remediated_messages,
+        )
+
+    @staticmethod
+    def extract_sample_dedup_meta(
+        initial_eval: Optional[Dict[str, Any]],
+        verified_eval: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """提取用于训练集融合轨迹聚类的元数据（优先非空且含结构化轨迹/FAQ的 verified_eval，回退 initial_eval）。"""
+        def _has_structured(ev: Optional[Dict[str, Any]]) -> bool:
+            if not isinstance(ev, dict) or not ev:
+                return False
+            return bool(
+                ev.get("trajectory_details")
+                or ev.get("faq_details")
+                or ev.get("node_trajectory")
+            )
+
+        if _has_structured(verified_eval):
+            src: Dict[str, Any] = verified_eval or {}
+        elif _has_structured(initial_eval):
+            src = initial_eval or {}
+        elif isinstance(verified_eval, dict) and verified_eval:
+            src = verified_eval
+        elif isinstance(initial_eval, dict) and initial_eval:
+            src = initial_eval
+        else:
+            src = {}
+
+        return {
+            "trajectory_details": list(src.get("trajectory_details") or []),
+            "faq_details": list(src.get("faq_details") or []),
+            "node_trajectory": list(src.get("node_trajectory") or []),
+        }
+
+    @staticmethod
+    def get_dedup_cache_path(dataset_file_path: str) -> str:
+        """获取数据集对应的 .dedup_cache.json 旁路缓存路径。"""
+        return DatasetDeduplicator.get_cache_path(dataset_file_path)
+
+    @staticmethod
+    def deduplicate_benchmark_export(
+        candidate_rows: List[Dict[str, Any]],
+        existing_rows: Optional[List[Dict[str, Any]]] = None,
+        config: Optional[DedupConfig] = None,
+        cache_path: Optional[str] = None,
+        dataset_file_path: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """封装评测集导出四步去重防稀释编排。"""
+        eff_cache: Optional[str] = cache_path or (
+            DatasetDeduplicator.get_cache_path(dataset_file_path)
+            if dataset_file_path
+            else None
+        )
+        return DatasetDeduplicator().deduplicate_benchmark_rows(
+            candidate_rows=candidate_rows,
+            existing_rows=existing_rows,
+            config=config,
+            cache_path=eff_cache,
+        )
+
+    @staticmethod
+    def deduplicate_training_export(
+        candidate_rows: List[Dict[str, Any]],
+        existing_rows: Optional[List[Dict[str, Any]]] = None,
+        config: Optional[DedupConfig] = None,
+        cache_path: Optional[str] = None,
+        dataset_file_path: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """封装训练集导出四步去重防稀释编排。"""
+        eff_cache: Optional[str] = cache_path or (
+            DatasetDeduplicator.get_cache_path(dataset_file_path)
+            if dataset_file_path
+            else None
+        )
+        return DatasetDeduplicator().deduplicate_training_rows(
+            candidate_rows=candidate_rows,
+            existing_rows=existing_rows,
+            config=config,
+            cache_path=eff_cache,
+        )
+
+    @staticmethod
     def ensure_sample_slices(
         sample_id: str,
         existing_slices: Optional[List[Dict[str, Any]]],
@@ -176,6 +278,8 @@ class FlywheelPipelineService:
         rule: Optional[UniversalRuleSchema] = None,
         scenario_id: Optional[str] = None,
         remediated_messages: Optional[List[ChatMessage]] = None,
+        trajectory_details: Optional[List[Dict[str, Any]]] = None,
+        faq_details: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[List[Dict[str, Any]], bool]:
         """
         统一补切题入口：
@@ -198,6 +302,8 @@ class FlywheelPipelineService:
             rule=rule,
             scenario=scenario,
             remediated_dialogue=remediated_messages,
+            trajectory_details=trajectory_details,
+            faq_details=faq_details,
         )
         return [s.model_dump() for s in slices], True
 
@@ -418,6 +524,8 @@ class FlywheelPipelineService:
             rule=rule,
             scenario=scenario,
             remediated_dialogue=record.remediated_messages,
+            trajectory_details=initial_eval.trajectory_details if initial_eval else None,
+            faq_details=initial_eval.faq_details if initial_eval else None,
         )
         record.benchmark_slices = slices
 
@@ -430,32 +538,57 @@ class FlywheelPipelineService:
         gold_output_path: str,
         discard_output_path: str,
         workers: int = 4,
-    ) -> Dict[str, int]:
+        on_record_done: Optional[Callable[[FlywheelRecord, List[ChatMessage]], Optional[bool]]] = None,
+        dedup_config: Optional[DedupConfig] = None,
+    ) -> Dict[str, Any]:
         """
-        批量并发治理流水线，支持断点续跑与边跑边落盘
+        批量并发治理流水线，支持断点续跑、同步回流样本池与训练集去重防稀释落盘
         """
         os.makedirs(os.path.dirname(os.path.abspath(gold_output_path)), exist_ok=True)
         os.makedirs(os.path.dirname(os.path.abspath(discard_output_path)), exist_ok=True)
 
+        # 读取已有黄金文件作为增量去重基底（支持断点续跑与防稀释）
+        preexisting_gold_rows: List[Dict[str, Any]] = []
+        if os.path.exists(gold_output_path):
+            with open(gold_output_path, "r", encoding="utf-8") as gf:
+                for line in gf:
+                    s_line = line.strip()
+                    if s_line:
+                        try:
+                            obj = json.loads(s_line)
+                            if isinstance(obj, dict):
+                                preexisting_gold_rows.append(obj)
+                        except Exception:
+                            pass
+
         # 提取已处理 ID
         processed_ids = self._get_processed_ids([gold_output_path, discard_output_path])
 
-        todo_items = []
+        todo_items: List[Tuple[str, PersonaDefinition, List[ChatMessage]]] = []
         for idx, item in enumerate(input_records):
             sid, _, matched_sc, chat_msgs = self._parse_dialogue_record_item(rule, item, idx)
             if sid in processed_ids:
                 continue
             todo_items.append((sid, matched_sc, chat_msgs))
 
-        stats = {"total": len(input_records), "skipped": len(processed_ids), "gold": 0, "discarded": 0}
+        stats: Dict[str, Any] = {
+            "total": len(input_records),
+            "skipped": len(processed_ids),
+            "gold": 0,
+            "discarded": 0,
+            "excluded_holdout": 0,
+            "failed_persist": 0,
+            "final_gold_count": len(preexisting_gold_rows),
+        }
+        new_gold_rows: List[Dict[str, Any]] = []
 
-        def _worker_task(sid, sc, msgs):
-            rec = self.process_single_dialogue_record(rule, sc, msgs, sample_id=sid)
-            # 安全落盘
-            self._flush_record(rec, gold_output_path, discard_output_path)
-            return rec.status
+        def _worker_task(
+            sid: str, sc: PersonaDefinition, msgs: List[ChatMessage]
+        ) -> Tuple[FlywheelRecord, List[ChatMessage]]:
+            rec: FlywheelRecord = self.process_single_dialogue_record(rule, sc, msgs, sample_id=sid)
+            return rec, msgs
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
             future_to_id = {
                 executor.submit(_worker_task, sid, sc, msgs): sid
                 for sid, sc, msgs in todo_items
@@ -463,13 +596,68 @@ class FlywheelPipelineService:
             for future in as_completed(future_to_id):
                 sid = future_to_id[future]
                 try:
-                    status = future.result()
-                    if status in ("GOLD_PASS", "REPAIRED_PASS"):
-                        stats["gold"] += 1
-                    else:
-                        stats["discarded"] += 1
+                    rec, orig_msgs = future.result()
                 except Exception as e:
-                    print(f"⚠️ [FlywheelPipeline] 样本 {sid} 处理异常: {e}")
+                    print(f"⚠️ [FlywheelPipeline] 样本 {sid} 治理推理异常: {e}")
+                    continue
+
+                is_holdout_source: bool = False
+                if on_record_done is not None:
+                    try:
+                        is_holdout_source = bool(on_record_done(rec, orig_msgs))
+                    except Exception as cb_err:
+                        print(f"⚠️ [FlywheelPipeline] 样本 {sid} 持久化/留出核查异常，已阻断写入黄金集: {cb_err}")
+                        stats["failed_persist"] += 1
+                        continue
+
+                if rec.status in ("GOLD_PASS", "REPAIRED_PASS"):
+                    if is_holdout_source:
+                        stats["excluded_holdout"] += 1
+                        continue
+                    gold_row: Dict[str, Any] = self._build_output_row(rec)
+                    eval_meta: Dict[str, Any] = self.extract_sample_dedup_meta(
+                        rec.initial_eval.model_dump() if rec.initial_eval else None,
+                        rec.verified_eval.model_dump() if rec.verified_eval else None,
+                    )
+                    gold_row["_dedup_meta"] = eval_meta
+                    new_gold_rows.append(gold_row)
+                    with self._lock:
+                        self._append_row_unlocked(gold_output_path, self._strip_internal_meta(gold_row))
+                    stats["gold"] += 1
+                else:
+                    self._flush_record(rec, gold_output_path, discard_output_path)
+                    stats["discarded"] += 1
+
+        if new_gold_rows:
+            final_rows, dedup_stats = self.deduplicate_training_export(
+                candidate_rows=new_gold_rows,
+                existing_rows=preexisting_gold_rows if preexisting_gold_rows else None,
+                config=dedup_config,
+                dataset_file_path=gold_output_path,
+            )
+            tmp_gold: str = f"{gold_output_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+            with self._lock:
+                try:
+                    with open(tmp_gold, "w", encoding="utf-8") as gf_out:
+                        for row in final_rows:
+                            gf_out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    os.replace(tmp_gold, gold_output_path)
+                except Exception:
+                    if os.path.exists(tmp_gold):
+                        try:
+                            os.remove(tmp_gold)
+                        except Exception:
+                            pass
+                    raise
+            if not preexisting_gold_rows and not bool(dedup_stats.get("enabled")):
+                stale_cache: str = self.get_dedup_cache_path(gold_output_path)
+                if os.path.exists(stale_cache):
+                    try:
+                        os.remove(stale_cache)
+                    except Exception:
+                        pass
+            stats["final_gold_count"] = len(final_rows)
+            stats["dedup_stats"] = dedup_stats
 
         return stats
 
@@ -491,10 +679,9 @@ class FlywheelPipelineService:
                                 pass
         return processed
 
-    def _flush_record(self, record: FlywheelRecord, gold_path: str, discard_path: str):
-        target_path = gold_path if record.status in ("GOLD_PASS", "REPAIRED_PASS") else discard_path
-
-        out_obj = {
+    def _build_output_row(self, record: FlywheelRecord) -> Dict[str, Any]:
+        target_msgs: List[ChatMessage] = record.remediated_messages or record.raw_messages
+        return {
             "id": record.id,
             "metadata": {
                 "rule_id": record.rule_id,
@@ -507,16 +694,28 @@ class FlywheelPipelineService:
             },
             "applied_actions": record.applied_actions,
             "benchmark_slices": [s.model_dump() for s in record.benchmark_slices],
-            "messages": [
-                m.to_dict()
-                for m in (record.remediated_messages or record.raw_messages)
-            ],
+            "messages": self._messages_to_dicts(target_msgs),
         }
 
+    @staticmethod
+    def _strip_internal_meta(row: Dict[str, Any]) -> Dict[str, Any]:
+        if "_dedup_meta" not in row:
+            return row
+        cleaned: Dict[str, Any] = dict(row)
+        cleaned.pop("_dedup_meta", None)
+        return cleaned
+
+    @staticmethod
+    def _append_row_unlocked(target_path: str, out_obj: Dict[str, Any]) -> None:
+        with open(target_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(out_obj, ensure_ascii=False) + "\n")
+            f.flush()
+
+    def _flush_record(self, record: FlywheelRecord, gold_path: str, discard_path: str) -> None:
+        target_path = gold_path if record.status in ("GOLD_PASS", "REPAIRED_PASS") else discard_path
+        out_obj = self._build_output_row(record)
         with self._lock:
-            with open(target_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(out_obj, ensure_ascii=False) + "\n")
-                f.flush()
+            self._append_row_unlocked(target_path, out_obj)
 
     @staticmethod
     def _parse_dialogue_record_item(
@@ -664,10 +863,18 @@ class FlywheelPipelineService:
                 ordered_samples=ordered,
             )
             if output_path:
-                tmp_path = f"{output_path}.tmp"
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
-                os.replace(tmp_path, output_path)
+                tmp_path = f"{output_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp_path, output_path)
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                    raise
             return snapshot
 
         # 初始化骨架文件，确保轮询期间立即可读

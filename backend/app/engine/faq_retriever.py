@@ -246,21 +246,38 @@ class UniversalFAQRetriever:
             UniversalFAQRetriever._embedding_cache[cache_key] = vectors
         return vectors
 
+    def _has_meaningful_lexical_hit(self, query: str, doc_idx: int, lexical_score: float) -> bool:
+        """校验词法检索是否构成有效业务匹配（过滤单字停用词偶然命中）。"""
+        if lexical_score <= 0.0 or not self.bm25 or doc_idx < 0 or doc_idx >= len(self.bm25.doc_tokens):
+            return False
+        q_tokens = tokenize_chinese_lexical(query)
+        if not q_tokens:
+            return False
+        q_set = set(q_tokens)
+        doc_set = set(self.bm25.doc_tokens[doc_idx])
+        matched = [t for t in q_set if t in doc_set]
+        if not matched:
+            return False
+        has_strong_tok = any(len(t) >= 2 for t in matched)
+        coverage = len(matched) / float(len(q_set))
+        return bool(lexical_score >= 1.5 or (has_strong_tok and coverage >= 0.25) or coverage >= 0.5)
+
     def search(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         统一检索入口: 支持 lexical_only / vector_only / hybrid
-        输出结构: [{'faq': FAQItem, 'score': float, 'retrieval_source': str}]
+        输出结构: [{'faq': FAQItem, 'score': float, 'lexical_score': float, 'dense_score': Optional[float], 'raw_hit': bool, 'retrieval_source': str}]
         """
         k = top_k or self.config.top_k or 3
         if not self.kb or not query.strip():
             return []
 
         mode = self.config.retrieval_mode or "hybrid"
+        kb_idx_map = {item.id: idx for idx, item in enumerate(self.kb)}
 
         # 1. 词法检索结果
         lexical_results = self.bm25.search(query, top_k=len(self.kb)) if self.bm25 else []
         lexical_rank_map = {item.id: idx + 1 for idx, (item, _) in enumerate(lexical_results)}
-        lexical_score_map = {item.id: score for item, score in lexical_results}
+        lexical_score_map = {item.id: float(score) for item, score in lexical_results}
 
         # 2. 稠密向量检索结果
         dense_rank_map = {}
@@ -273,7 +290,7 @@ class UniversalFAQRetriever:
             if q_vecs:
                 q_vec = q_vecs[0]
                 dense_scores = [
-                    (self.kb[i], self._cosine_similarity(q_vec, kb_vecs[i]))
+                    (self.kb[i], float(self._cosine_similarity(q_vec, kb_vecs[i])))
                     for i in range(len(self.kb))
                 ]
                 dense_sorted = sorted(dense_scores, key=lambda x: x[1], reverse=True)
@@ -282,24 +299,36 @@ class UniversalFAQRetriever:
 
         # 3. 结果融合
         final_items: List[Dict[str, Any]] = []
+        dense_hit_threshold = 0.45
 
         if mode == "lexical_only" or not dense_rank_map:
             for item, sc in lexical_results[:k]:
+                lex_sc = float(sc)
+                d_sc = dense_score_map.get(item.id)
+                lex_hit = self._has_meaningful_lexical_hit(query, kb_idx_map.get(item.id, -1), lex_sc)
                 final_items.append({
                     "faq": item,
-                    "score": round(float(sc), 4),
+                    "score": round(lex_sc, 4),
+                    "lexical_score": round(lex_sc, 4),
+                    "dense_score": round(float(d_sc), 4) if d_sc is not None else None,
+                    "raw_hit": lex_hit,
                     "retrieval_source": "lexical",
                 })
         elif mode == "vector_only":
             sorted_dense = sorted(
-                [(it, dense_score_map.get(it.id, 0.0)) for it in self.kb],
+                [(it, float(dense_score_map.get(it.id, 0.0))) for it in self.kb],
                 key=lambda x: x[1],
                 reverse=True,
             )
             for item, sc in sorted_dense[:k]:
+                lex_sc = float(lexical_score_map.get(item.id, 0.0))
+                d_sc = float(sc)
                 final_items.append({
                     "faq": item,
-                    "score": round(float(sc), 4),
+                    "score": round(d_sc, 4),
+                    "lexical_score": round(lex_sc, 4),
+                    "dense_score": round(d_sc, 4),
+                    "raw_hit": d_sc >= dense_hit_threshold,
                     "retrieval_source": "dense_vector",
                 })
         else:
@@ -310,18 +339,25 @@ class UniversalFAQRetriever:
             rrf_constant = 60.0
 
             scored_candidates = []
-            for item in self.kb:
+            for idx, item in enumerate(self.kb):
                 r_lex = lexical_rank_map.get(item.id, len(self.kb) + 1)
                 r_dense = dense_rank_map.get(item.id, len(self.kb) + 1)
 
                 rrf_score = (w_lex / (rrf_constant + r_lex)) + (w_dense / (rrf_constant + r_dense))
-                scored_candidates.append((item, rrf_score, r_lex, r_dense))
+                scored_candidates.append((idx, item, rrf_score, r_lex, r_dense))
 
-            scored_candidates.sort(key=lambda x: x[1], reverse=True)
-            for item, rrf_sc, r_lex, r_dense in scored_candidates[:k]:
+            scored_candidates.sort(key=lambda x: x[2], reverse=True)
+            for idx, item, rrf_sc, r_lex, r_dense in scored_candidates[:k]:
+                lex_sc = float(lexical_score_map.get(item.id, 0.0))
+                d_sc = dense_score_map.get(item.id)
+                lex_hit = self._has_meaningful_lexical_hit(query, idx, lex_sc)
+                dense_hit = (d_sc is not None and float(d_sc) >= dense_hit_threshold)
                 final_items.append({
                     "faq": item,
                     "score": round(float(rrf_sc), 6),
+                    "lexical_score": round(lex_sc, 4),
+                    "dense_score": round(float(d_sc), 4) if d_sc is not None else None,
+                    "raw_hit": bool(lex_hit or dense_hit),
                     "retrieval_source": "hybrid_rrf",
                     "lexical_rank": r_lex,
                     "dense_rank": r_dense,

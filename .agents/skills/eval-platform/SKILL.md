@@ -155,15 +155,17 @@ evalctl --timeout 0 flywheel judge <sample_id> --rule-id demo_after_sales --judg
 evalctl --timeout 0 flywheel remediate <sample_id> --remediate-model-id vertex-gemini-flash-judge
 evalctl flywheel slices-get <sample_id>
 
-# 4. 导出黄金 SFT 训练集（与留出评测集天然防泄漏隔离）或导出为 Benchmark 评测集
+# 4. 导出黄金 SFT 训练集（默认排除已导出评测集的留出同源对话并启用去重防稀释）或导出为 Benchmark 评测集
 #    注：如需导出采集到的 assistant 思考链用于 CoT 蒸馏，显式加 --inject-thinking（默认不导出）
 #    注：replace 修复仅改写 content 不会重生成 thinking，强 CoT 蒸馏建议优先筛选 GOLD_PASS 样本导出：
 #        evalctl flywheel export-selected --sample-id <id1> --sample-id <id2> --inject-thinking
-evalctl flywheel export-gold --rule-id demo_after_sales --version-tag v1.1
+#    去重防稀释参数：--enable-dedup/--no-dedup、--cluster-quota <K>（训练默认20/评测默认5）、--sim-threshold <θ>（默认0.82）、--target-count <N>
+#    SFT 导出还支持：--mode create|append、--target-dataset-id <id>、--no-exclude-benchmark-exported（默认排除留出）
+evalctl flywheel export-gold --rule-id demo_after_sales --version-tag v1.1 --cluster-quota 20 --sim-threshold 0.82
 evalctl flywheel export-gold --rule-id demo_after_sales --version-tag v1.1_cot --inject-thinking
-evalctl flywheel export-benchmark <sample_id> --dataset-id fw_eval_v1 --name "飞轮回归评测集"
+evalctl flywheel export-benchmark <sample_id> --dataset-id fw_eval_v1 --name "飞轮回归评测集" --cluster-quota 5
 
-# 5. 批量飞轮治理（初检->AI修复->二检->gold/discarded；--input-file-path 为服务端路径）
+# 5. 批量飞轮治理（初检->AI修复->二检->gold/discarded；--input-file-path 为服务端路径；默认入池 Upsert 并对黄金集去重）
 evalctl --timeout 0 flywheel batch --rule-id demo_after_sales --input-file-path data/runs/raw.jsonl \
   --judge-model-id vertex-gemini-flash-judge --workers 1 --wait --wait-timeout 3600
 
@@ -184,11 +186,14 @@ evalctl --out data/runs/inspect_report.json flywheel inspect-report <task_id>
 # 1. 查看历史基准模型线与分类分布
 evalctl dataset filter-options demo_benchmark
 
-# 2. 试算并另存为聚焦薄弱错题的新评测集
+# 2. 试算并另存为聚焦薄弱错题的新评测集（append 模式自动开启四步去重，可选 --enable-dedup/--cluster-quota/--sim-threshold/--target-count）
 evalctl dataset export-preview demo_benchmark --export-scope failed_only --model-line gpt-oss-20b
 evalctl dataset export demo_benchmark \
   --export-scope failed_only --model-line gpt-oss-20b \
   --export-target save_dataset --target-dataset-id demo_failed_focus
+
+# 3. 外部数据集追加导入（append 模式默认去重，同步维护 .dedup_cache.json；--no-dedup 可显式关闭）
+evalctl dataset import --dataset-id ext_eval --dataset-type benchmark --mode append --file raw_eval.jsonl --cluster-quota 5
 ```
 
 ---

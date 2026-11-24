@@ -50,6 +50,7 @@ import type {
   DatasetRecord,
   BenchmarkSample,
   DatasetImportRequest,
+  DedupConfig,
   BenchmarkDatasetFilterOptionsResponse,
   BenchmarkExportPreviewResponse,
   BenchmarkExportFilterRequest,
@@ -63,6 +64,28 @@ const { Text } = Typography;
 const { TextArea } = Input;
 
 const DEMO_SAMPLE_JSONL = `{"id": "gen_004", "category": "通用百科常识", "sub_category": "计算机网络", "difficulty": "easy", "source": "MMLU计算机基础", "max_new_tokens": 64, "messages": [{"role": "user", "content": "请简短回答：HTTP状态码 404 和 502 分别代表什么含义？"}], "reference": "404 表示未找到请求的资源（Not Found）；502 表示错误网关（Bad Gateway），即网关或代理服务器从上游服务器收到无效响应。", "rubric": "准确说明 404 为未找到资源/Not Found，502 为网关错误/Bad Gateway。", "regex_constraints": ["未找到|不存在|Not Found", "网关|上游|Bad Gateway", "!星云智联|售后专员"]}`;
+
+const buildDatasetDedupConfig = (values: any): DedupConfig => ({
+  enabled: !!values.dedup_enabled,
+  cluster_quota:
+    values.dedup_cluster_quota && Number(values.dedup_cluster_quota) > 0
+      ? Number(values.dedup_cluster_quota)
+      : null,
+  answer_sim_threshold:
+    values.dedup_answer_sim_threshold !== undefined &&
+    values.dedup_answer_sim_threshold !== null
+      ? Number(values.dedup_answer_sim_threshold)
+      : 0.82,
+  near_dup_input_threshold:
+    values.dedup_near_dup_input_threshold !== undefined &&
+    values.dedup_near_dup_input_threshold !== null
+      ? Number(values.dedup_near_dup_input_threshold)
+      : 0.9,
+  target_total_count:
+    values.dedup_target_total_count && Number(values.dedup_target_total_count) > 0
+      ? Number(values.dedup_target_total_count)
+      : null,
+});
 
 export const DatasetCenter: React.FC = () => {
   const navigate = useNavigate();
@@ -311,6 +334,7 @@ export const DatasetCenter: React.FC = () => {
         target_dataset_id: v.target_dataset_id?.trim() || undefined,
         target_dataset_name: v.target_dataset_name?.trim() || undefined,
         save_mode: v.save_mode || 'overwrite',
+        dedup_config: buildDatasetDedupConfig(v),
       };
     },
     [filterExportForm]
@@ -354,6 +378,11 @@ export const DatasetCenter: React.FC = () => {
       save_mode: 'overwrite',
       target_dataset_id: `${dataset.id}_filtered`,
       target_dataset_name: `${dataset.id}_filtered.jsonl`,
+      dedup_enabled: false,
+      dedup_cluster_quota: 5,
+      dedup_answer_sim_threshold: 0.82,
+      dedup_near_dup_input_threshold: 0.9,
+      dedup_target_total_count: undefined,
     });
     setFilterExportVisible(true);
     setFilterOptionsLoading(true);
@@ -413,7 +442,14 @@ export const DatasetCenter: React.FC = () => {
         a.download = res.filename || `${exportingDataset.id}_filtered.jsonl`;
         a.click();
         URL.revokeObjectURL(url);
-        message.success(res.message || `已导出 ${res.exported_count} 道考题`);
+        const dropped = res.dedup_stats?.enabled
+          ? (res.dedup_stats.exact_hash_dropped || 0) +
+            (res.dedup_stats.near_dup_dropped || 0) +
+            (res.dedup_stats.quota_dropped || 0)
+          : 0;
+        message.success(
+          `${res.message || `已导出 ${res.exported_count} 道考题`}${dropped > 0 ? `（去重过滤 ${dropped} 道）` : ''}`
+        );
       } else {
         message.success(res.message || '新评测集另存成功');
         loadDatasets();
@@ -433,6 +469,9 @@ export const DatasetCenter: React.FC = () => {
       dataset_type: activeTab === 'benchmark' ? 'benchmark' : 'flywheel_gold',
       mode: 'overwrite',
       mark_as_holdout: false,
+      dedup_enabled: false,
+      dedup_answer_sim_threshold: 0.82,
+      dedup_near_dup_input_threshold: 0.9,
     });
     setImportSourceType('file');
     setUploadedFileName('');
@@ -464,6 +503,7 @@ export const DatasetCenter: React.FC = () => {
         dataset_type: values.dataset_type,
         mode: values.mode,
         mark_as_holdout: values.dataset_type === 'benchmark' ? !!values.mark_as_holdout : false,
+        dedup_config: buildDatasetDedupConfig(values),
       };
 
       if (importSourceType === 'file') {
@@ -794,9 +834,13 @@ export const DatasetCenter: React.FC = () => {
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <Form.Item name="mode" label="写入模式" rules={[{ required: true }]}>
-              <Radio.Group>
+              <Radio.Group
+                onChange={(e) => {
+                  importForm.setFieldsValue({ dedup_enabled: e.target.value === 'append' });
+                }}
+              >
                 <Radio value="overwrite">覆盖现有数据集 (自动清空旧战绩)</Radio>
-                <Radio value="append">追加合并 (按 ID 增量去重更新)</Radio>
+                <Radio value="append">追加合并 (序列哈希 + 本地语义去重)</Radio>
               </Radio.Group>
             </Form.Item>
 
@@ -810,6 +854,54 @@ export const DatasetCenter: React.FC = () => {
                 <Switch checkedChildren="🔒 留出题 (Holdout)" unCheckedChildren="📄 普通题 (Regular)" />
               </Form.Item>
             )}
+          </div>
+
+          <div className="p-3 mb-3 bg-slate-50 rounded-lg border border-slate-200 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-xs font-semibold text-slate-800">
+                  去重与防稀释策略（零额外模型调用）
+                </div>
+                <span className="text-3xs text-slate-500 block">
+                  append 模式默认开启；overwrite 默认关闭（可手动开启）
+                </span>
+              </div>
+              <Form.Item name="dedup_enabled" valuePropName="checked" initialValue={false} className="m-0">
+                <Switch checkedChildren="开启去重" unCheckedChildren="关闭去重" />
+              </Form.Item>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+              <Form.Item
+                name="dedup_cluster_quota"
+                label={<span className="text-3xs text-slate-600">单簇保留上限 K</span>}
+                className="m-0"
+              >
+                <InputNumber size="small" min={1} max={1000} placeholder="评测5/训练20" className="w-full" />
+              </Form.Item>
+              <Form.Item
+                name="dedup_answer_sim_threshold"
+                label={<span className="text-3xs text-slate-600">同答拆簇阈值 θ</span>}
+                initialValue={0.82}
+                className="m-0"
+              >
+                <InputNumber size="small" min={0} max={1} step={0.02} className="w-full" />
+              </Form.Item>
+              <Form.Item
+                name="dedup_near_dup_input_threshold"
+                label={<span className="text-3xs text-slate-600">老桶近似防重阈值</span>}
+                initialValue={0.9}
+                className="m-0"
+              >
+                <InputNumber size="small" min={0} max={1} step={0.02} className="w-full" />
+              </Form.Item>
+              <Form.Item
+                name="dedup_target_total_count"
+                label={<span className="text-3xs text-slate-600">目标总条数 (可选)</span>}
+                className="m-0"
+              >
+                <InputNumber size="small" min={1} placeholder="不限" className="w-full" />
+              </Form.Item>
+            </div>
           </div>
 
           <Form.Item label="数据源提供方式">
@@ -937,13 +1029,61 @@ export const DatasetCenter: React.FC = () => {
                     label={<span className="text-3xs text-slate-700">写入模式</span>}
                     className="m-0"
                   >
-                    <Radio.Group size="small">
+                    <Radio.Group
+                      size="small"
+                      onChange={(e) => {
+                        filterExportForm.setFieldsValue({ dedup_enabled: e.target.value === 'append' });
+                      }}
+                    >
                       <Radio value="overwrite">覆盖创建</Radio>
                       <Radio value="append">追加合并</Radio>
                     </Radio.Group>
                   </Form.Item>
                 </div>
               )}
+
+              <div className="pt-2 border-t border-slate-200 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <span className="text-3xs font-semibold text-slate-700">
+                      去重与防稀释过滤（追加合并模式默认开启，下载/覆盖默认关闭）
+                    </span>
+                  </div>
+                  <Form.Item name="dedup_enabled" valuePropName="checked" initialValue={false} className="m-0">
+                    <Switch size="small" checkedChildren="开启去重" unCheckedChildren="关闭去重" />
+                  </Form.Item>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+                  <Form.Item
+                    name="dedup_cluster_quota"
+                    label={<span className="text-3xs text-slate-600">单簇保留上限 K</span>}
+                    className="m-0"
+                  >
+                    <InputNumber size="small" min={1} max={500} className="w-full" />
+                  </Form.Item>
+                  <Form.Item
+                    name="dedup_answer_sim_threshold"
+                    label={<span className="text-3xs text-slate-600">同答拆簇阈值 θ</span>}
+                    className="m-0"
+                  >
+                    <InputNumber size="small" min={0} max={1} step={0.02} className="w-full" />
+                  </Form.Item>
+                  <Form.Item
+                    name="dedup_near_dup_input_threshold"
+                    label={<span className="text-3xs text-slate-600">老桶近似防重阈值</span>}
+                    className="m-0"
+                  >
+                    <InputNumber size="small" min={0} max={1} step={0.02} className="w-full" />
+                  </Form.Item>
+                  <Form.Item
+                    name="dedup_target_total_count"
+                    label={<span className="text-3xs text-slate-600">目标总题数 (可选)</span>}
+                    className="m-0"
+                  >
+                    <InputNumber size="small" min={1} placeholder="不限" className="w-full" />
+                  </Form.Item>
+                </div>
+              </div>
             </div>
 
             {/* 2. 抽样测评同款动态降频与战绩池过滤 */}

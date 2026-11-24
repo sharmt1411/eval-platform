@@ -8,6 +8,11 @@ import type {
   UniversalRuleSchema,
   DatasetRecord,
   DatasetImportRequest,
+  DedupStats,
+  BenchmarkDatasetFilterOptionsResponse,
+  BenchmarkExportFilterRequest,
+  BenchmarkExportPreviewResponse,
+  BenchmarkFilteredExportResponse,
   BenchmarkSample,
   BenchmarkRunRequest,
   BenchmarkTaskItem,
@@ -138,6 +143,7 @@ export const datasetsApi = {
     const res = await api.post<{
       message: string;
       imported_count: number;
+      dedup_stats?: DedupStats;
       dataset: DatasetRecord;
     }>('/datasets/import', data);
     return res.data;
@@ -147,16 +153,16 @@ export const datasetsApi = {
     return res.data;
   },
   getFilterOptions: async (datasetId: string) => {
-    const res = await api.get<import('../types').BenchmarkDatasetFilterOptionsResponse>(
+    const res = await api.get<BenchmarkDatasetFilterOptionsResponse>(
       `/datasets/${datasetId}/filter-options`
     );
     return res.data;
   },
   previewExport: async (
     datasetId: string,
-    data: import('../types').BenchmarkExportFilterRequest
+    data: BenchmarkExportFilterRequest
   ) => {
-    const res = await api.post<import('../types').BenchmarkExportPreviewResponse>(
+    const res = await api.post<BenchmarkExportPreviewResponse>(
       `/datasets/${datasetId}/export/preview`,
       data
     );
@@ -164,9 +170,9 @@ export const datasetsApi = {
   },
   exportFiltered: async (
     datasetId: string,
-    data: import('../types').BenchmarkExportFilterRequest
+    data: BenchmarkExportFilterRequest
   ) => {
-    const res = await api.post<import('../types').BenchmarkFilteredExportResponse>(
+    const res = await api.post<BenchmarkFilteredExportResponse>(
       `/datasets/${datasetId}/export`,
       data
     );
@@ -412,10 +418,18 @@ export const flywheelApi = {
     return res.data;
   },
   exportGold: async (params: ExportGoldDatasetRequest) => {
-    const res = await api.post<{ message: string; file_path: string; sample_count: number }>(
+    const { dedup_config, mode, target_dataset_id, ...queryParams } = params;
+    const hasBody = dedup_config !== undefined || mode !== undefined || target_dataset_id !== undefined;
+    const res = await api.post<{
+      message: string;
+      dataset_id?: string;
+      file_path: string;
+      sample_count: number;
+      dedup_stats?: DedupStats;
+    }>(
       '/flywheel/export',
-      null,
-      { params }
+      hasBody ? { mode, target_dataset_id, dedup_config } : null,
+      { params: { ...queryParams, mode, target_dataset_id } }
     );
     return res.data;
   },
@@ -449,8 +463,10 @@ export const flywheelApi = {
   exportSelectedSamples: async (data: BatchExportSelectedRequest) => {
     const res = await api.post<{
       message: string;
+      dataset_id?: string;
       file_path: string;
       sample_count: number;
+      dedup_stats?: DedupStats;
     }>('/flywheel/samples/export-selected', data);
     return res.data;
   },
@@ -475,6 +491,7 @@ export const flywheelApi = {
       dataset_id: string;
       file_path: string;
       sample_count: number;
+      dedup_stats?: DedupStats;
     }>(`/flywheel/samples/${sampleId}/export-benchmark`, data);
     return res.data;
   },
@@ -484,6 +501,7 @@ export const flywheelApi = {
       dataset_id: string;
       file_path: string;
       sample_count: number;
+      dedup_stats?: DedupStats;
     }>('/flywheel/batch-export-benchmark', data);
     return res.data;
   },

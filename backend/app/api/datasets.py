@@ -6,6 +6,7 @@ import os
 import re
 import json
 import time
+import threading
 from typing import List, Dict, Any, Optional, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -19,7 +20,9 @@ from backend.app.schemas.benchmark import (
     BenchmarkDatasetFilterOptionsResponse,
     SamplingPreviewResponse,
 )
+from backend.app.schemas.flywheel import DedupConfig
 from backend.app.engine.benchmark_sampler import BenchmarkSamplingEngine
+from backend.app.engine.deduplicator import DatasetDeduplicator
 
 router = APIRouter(prefix="/datasets", tags=["数据集管理"])
 
@@ -32,6 +35,48 @@ class DatasetImportRequest(BaseModel):
     content: Optional[str] = Field(default=None, description="JSONL 或 JSON 数组原始文本内容")
     samples: Optional[List[Dict[str, Any]]] = Field(default=None, description="已解析的样本字典数组")
     source_file_path: Optional[str] = Field(default=None, description="服务端本地外部文件路径")
+    dedup_config: Optional[DedupConfig] = Field(
+        default=None,
+        description="去重与防稀释配置（append 模式默认开启，overwrite 模式默认关闭除非显式启用）",
+    )
+
+
+def _load_existing_jsonl_rows(fpath: str) -> List[Dict[str, Any]]:
+    """读取既有 JSONL 数据集文件为字典列表"""
+    rows: List[Dict[str, Any]] = []
+    if not os.path.exists(fpath):
+        return rows
+    with open(fpath, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+                if isinstance(obj, dict):
+                    rows.append(obj)
+            except Exception:
+                pass
+    return rows
+
+
+def _write_jsonl_atomic(fpath: str, rows: List[Dict[str, Any]]) -> None:
+    """原子写出 JSONL 文件 (.tmp.{pid}.{tid} + os.replace)"""
+    parent_dir = os.path.dirname(os.path.abspath(fpath))
+    os.makedirs(parent_dir, exist_ok=True)
+    tmp_path = f"{fpath}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, fpath)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise
 
 
 def _count_jsonl_lines(fpath: str) -> int:
@@ -209,7 +254,7 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
     if not raw_items:
         raise HTTPException(status_code=400, detail="未解析到任何有效样本，请检查导入内容是否为空")
 
-    validated_lines: List[str] = []
+    candidate_rows: List[Dict[str, Any]] = []
     for idx, item in enumerate(raw_items, start=1):
         if payload.dataset_type == "benchmark":
             if "id" not in item or not str(item["id"]).strip():
@@ -220,7 +265,7 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
                 sample_obj = BenchmarkSample(**item)
                 # 导出时保留紧凑无冗余 None 的标准字典，若核心字段存在则完整输出
                 dump_dict = sample_obj.model_dump(exclude_none=True)
-                validated_lines.append(json.dumps(dump_dict, ensure_ascii=False))
+                candidate_rows.append(dump_dict)
             except Exception as e:
                 raise HTTPException(
                     status_code=400,
@@ -233,22 +278,59 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
                     status_code=400,
                     detail=f"第 {idx} 条样本缺少有效的 messages 数组",
                 )
-            validated_lines.append(json.dumps(item, ensure_ascii=False))
+            candidate_rows.append(dict(item))
 
     os.makedirs(settings.DATASETS_DIR, exist_ok=True)
     fname = f"{clean_id}.jsonl"
     fpath = os.path.join(settings.DATASETS_DIR, fname)
 
-    write_mode = "a" if (payload.mode == "append" and os.path.exists(fpath)) else "w"
-    with open(fpath, write_mode, encoding="utf-8") as f:
-        for line in validated_lines:
-            f.write(line + "\n")
+    is_append = payload.mode == "append" and os.path.exists(fpath)
+    existing_rows: Optional[List[Dict[str, Any]]] = (
+        _load_existing_jsonl_rows(fpath) if is_append else None
+    )
+
+    if payload.dedup_config is not None:
+        eff_dedup_cfg = payload.dedup_config
+    elif is_append:
+        eff_dedup_cfg = DedupConfig(enabled=True)
+    else:
+        eff_dedup_cfg = DedupConfig(enabled=False)
+
+    cache_path = DatasetDeduplicator.get_cache_path(fpath)
+    deduper = DatasetDeduplicator()
+    if payload.dataset_type == "benchmark":
+        final_rows, dedup_stats = deduper.deduplicate_benchmark_rows(
+            candidate_rows=candidate_rows,
+            existing_rows=existing_rows,
+            config=eff_dedup_cfg,
+            cache_path=cache_path if eff_dedup_cfg.enabled else None,
+        )
+    else:
+        final_rows, dedup_stats = deduper.deduplicate_training_rows(
+            candidate_rows=candidate_rows,
+            existing_rows=existing_rows,
+            config=eff_dedup_cfg,
+            cache_path=cache_path if eff_dedup_cfg.enabled else None,
+        )
+
+    if not eff_dedup_cfg.enabled and not is_append and os.path.exists(cache_path):
+        try:
+            os.remove(cache_path)
+        except Exception:
+            pass
+
+    _write_jsonl_atomic(fpath, final_rows)
 
     # 覆盖重建同名数据集时，自然作废该路径下的历史评测流水，防止旧战绩残留
-    if write_mode == "w":
+    if not is_append:
         BenchmarkSamplingEngine.reset_trackers_in_db(db=db, dataset_path=fpath)
 
-    total_cnt = _count_jsonl_lines(fpath)
+    total_cnt = len(final_rows)
+    imported_cnt = (
+        int(dedup_stats.get("kept_candidates", len(candidate_rows)))
+        if eff_dedup_cfg.enabled
+        else len(candidate_rows)
+    )
     existing = db.query(DatasetRecord).filter(DatasetRecord.id == clean_id).first()
     if existing:
         existing.name = fname
@@ -269,9 +351,19 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
         db.add(rec)
     db.commit()
 
+    dropped_cnt = (
+        int(dedup_stats.get("exact_hash_dropped", 0))
+        + int(dedup_stats.get("near_dup_dropped", 0))
+        + int(dedup_stats.get("quota_dropped", 0))
+    )
+    msg = (
+        f"成功导入 {imported_cnt} 条样本至数据集 [{clean_id}]"
+        + (f"（去重防稀释过滤 {dropped_cnt} 条）" if eff_dedup_cfg.enabled and dropped_cnt > 0 else "")
+    )
     return {
-        "message": f"成功导入 {len(validated_lines)} 条样本至数据集 [{clean_id}]",
-        "imported_count": len(validated_lines),
+        "message": msg,
+        "imported_count": imported_cnt,
+        "dedup_stats": dedup_stats,
         "dataset": {
             "id": rec.id,
             "name": rec.name,
@@ -285,7 +377,7 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
 
 @router.delete("/{dataset_id}")
 def delete_dataset(dataset_id: str, db: Session = Depends(get_db)):
-    """删除指定数据集资产记录及本地文件"""
+    """删除指定数据集资产记录及本地文件（含去重向量旁路缓存）"""
     rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
     fpath = rec.file_path if rec else os.path.join(settings.DATASETS_DIR, f"{dataset_id}.jsonl")
 
@@ -298,6 +390,13 @@ def delete_dataset(dataset_id: str, db: Session = Depends(get_db)):
             os.remove(fpath)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"删除本地文件失败: {str(e)}")
+
+    cache_path = DatasetDeduplicator.get_cache_path(fpath)
+    if os.path.exists(cache_path):
+        try:
+            os.remove(cache_path)
+        except Exception:
+            pass
 
     return {"message": f"数据集 {dataset_id} 已删除"}
 
@@ -367,22 +466,35 @@ def export_filtered_benchmark_dataset(
         return d
 
     exported_rows = [_serialize_sample(s) for s in filtered]
+    deduper = DatasetDeduplicator()
 
     if payload.export_target == "download":
-        jsonl_content = "\n".join(json.dumps(r, ensure_ascii=False) for r in exported_rows)
+        eff_dl_cfg = (
+            payload.dedup_config
+            if payload.dedup_config is not None
+            else DedupConfig(enabled=False)
+        )
+        dl_rows, dedup_stats = deduper.deduplicate_benchmark_rows(
+            candidate_rows=exported_rows,
+            existing_rows=None,
+            config=eff_dl_cfg,
+            cache_path=None,
+        )
+        jsonl_content = "\n".join(json.dumps(r, ensure_ascii=False) for r in dl_rows)
         scope_tag = payload.export_scope
         line_tag = re.sub(r"[^A-Za-z0-9_\-]", "_", payload.sampling_config.model_line.strip()) if payload.sampling_config.model_line else ""
         suffix = f"_{line_tag}_{scope_tag}" if line_tag else f"_{scope_tag}"
         filename = f"{dataset_id}{suffix}.jsonl"
         return {
-            "message": f"成功过滤导出 {len(exported_rows)} / {len(samples)} 道评测题",
+            "message": f"成功过滤导出 {len(dl_rows)} / {len(samples)} 道评测题",
             "dataset_id": dataset_id,
             "filename": filename,
             "total_samples": len(samples),
-            "exported_count": len(exported_rows),
+            "exported_count": len(dl_rows),
             "export_scope": payload.export_scope,
             "export_target": "download",
             "sampling_stats": stats,
+            "dedup_stats": dedup_stats,
             "jsonl_content": jsonl_content,
         }
 
@@ -403,26 +515,31 @@ def export_filtered_benchmark_dataset(
     target_fname = f"{clean_target_id}.jsonl"
     target_fpath = os.path.join(settings.DATASETS_DIR, target_fname)
 
-    final_rows = exported_rows
-    if payload.save_mode == "append" and os.path.exists(target_fpath):
-        existing_map: Dict[str, Dict[str, Any]] = {}
-        with open(target_fpath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        obj = json.loads(line)
-                        if isinstance(obj, dict) and "id" in obj:
-                            existing_map[str(obj["id"])] = obj
-                    except Exception:
-                        pass
-        for r in exported_rows:
-            existing_map[str(r["id"])] = r
-        final_rows = list(existing_map.values())
+    is_append = payload.save_mode == "append" and os.path.exists(target_fpath)
+    existing_rows: Optional[List[Dict[str, Any]]] = (
+        _load_existing_jsonl_rows(target_fpath) if is_append else None
+    )
+    if payload.dedup_config is not None:
+        eff_save_cfg = payload.dedup_config
+    elif is_append:
+        eff_save_cfg = DedupConfig(enabled=True)
+    else:
+        eff_save_cfg = DedupConfig(enabled=False)
 
-    with open(target_fpath, "w", encoding="utf-8") as f:
-        for r in final_rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    cache_path = DatasetDeduplicator.get_cache_path(target_fpath)
+    final_rows, dedup_stats = deduper.deduplicate_benchmark_rows(
+        candidate_rows=exported_rows,
+        existing_rows=existing_rows,
+        config=eff_save_cfg,
+        cache_path=cache_path if eff_save_cfg.enabled else None,
+    )
+    if not eff_save_cfg.enabled and payload.save_mode == "overwrite" and os.path.exists(cache_path):
+        try:
+            os.remove(cache_path)
+        except Exception:
+            pass
+
+    _write_jsonl_atomic(target_fpath, final_rows)
 
     if payload.save_mode == "overwrite":
         BenchmarkSamplingEngine.reset_trackers_in_db(db=db, dataset_path=target_fpath)
@@ -449,14 +566,20 @@ def export_filtered_benchmark_dataset(
         db.add(rec)
     db.commit()
 
+    exported_cnt = (
+        int(dedup_stats.get("kept_candidates", len(exported_rows)))
+        if eff_save_cfg.enabled
+        else len(exported_rows)
+    )
     return {
-        "message": f"已另存为新评测集 [{clean_target_id}]（共 {len(final_rows)} 道考题，本次导出 {len(exported_rows)} 道）",
+        "message": f"已另存为新评测集 [{clean_target_id}]（共 {len(final_rows)} 道考题，本次导出 {exported_cnt} 道）",
         "dataset_id": dataset_id,
         "total_samples": len(samples),
-        "exported_count": len(exported_rows),
+        "exported_count": exported_cnt,
         "export_scope": payload.export_scope,
         "export_target": "save_dataset",
         "sampling_stats": stats,
+        "dedup_stats": dedup_stats,
         "saved_dataset": {
             "id": rec.id,
             "name": rec.name,

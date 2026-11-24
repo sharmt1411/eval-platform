@@ -12,6 +12,7 @@ _EXPORTS: Dict[str, Tuple[str, str]] = {
     "BenchmarkSamplingEngine": ("backend.app.engine.benchmark_sampler", "BenchmarkSamplingEngine"),
     "ProgressiveContextSlicer": ("backend.app.engine.slicer", "ProgressiveContextSlicer"),
     "UniversalFAQRetriever": ("backend.app.engine.faq_retriever", "UniversalFAQRetriever"),
+    "DatasetDeduplicator": ("backend.app.engine.deduplicator", "DatasetDeduplicator"),
 }
 
 __all__ = list(_EXPORTS.keys())

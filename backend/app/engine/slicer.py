@@ -21,6 +21,15 @@ class ProgressiveContextSlicer:
     """通用累积纠正考题切片引擎"""
 
     @staticmethod
+    def _safe_turn_int(val: Any) -> Optional[int]:
+        if val is None or isinstance(val, bool):
+            return None
+        if isinstance(val, int):
+            return val
+        digits: List[str] = re.findall(r"\d+", str(val))
+        return int(digits[0]) if digits else None
+
+    @staticmethod
     def slice_dialogue(
         sample_id: str,
         raw_dialogue: List[ChatMessage],
@@ -30,6 +39,8 @@ class ProgressiveContextSlicer:
         scenario: Optional[PersonaDefinition] = None,
         category: str = "飞轮实战质检",
         remediated_dialogue: Optional[List[ChatMessage]] = None,
+        trajectory_details: Optional[List[Dict[str, Any]]] = None,
+        faq_details: Optional[List[Dict[str, Any]]] = None,
     ) -> List[FlywheelBenchmarkSlice]:
         """
         将单通多轮实战对弈及修复成果切割为标准 Benchmark 评测切片。
@@ -135,6 +146,27 @@ class ProgressiveContextSlicer:
 
         slices: List[FlywheelBenchmarkSlice] = []
         default_sys_content = rule.bot_config.system_prompt if (rule and rule.bot_config) else "你是专业的业务对话机器人，请按照业务规范严谨合规作答。"
+        rule_id_val: Optional[str] = rule.rule_id if rule else None
+
+        # 预处理 trajectory_details 按轮次升序，供定位 target_turn 所属节点
+        parsed_traj: List[Tuple[int, str]] = []
+        for td in trajectory_details or []:
+            if not isinstance(td, dict):
+                continue
+            t_num = ProgressiveContextSlicer._safe_turn_int(td.get("turn"))
+            nid_str = str(td.get("node_id") or "").strip()
+            if t_num is not None and nid_str:
+                parsed_traj.append((t_num, nid_str))
+        parsed_traj.sort(key=lambda x: x[0])
+
+        # 预处理 faq_details 按 assistant_turn 建立索引
+        faq_by_turn: Dict[int, Dict[str, Any]] = {}
+        for fd in faq_details or []:
+            if not isinstance(fd, dict):
+                continue
+            a_t = ProgressiveContextSlicer._safe_turn_int(fd.get("assistant_turn"))
+            if a_t is not None and a_t not in faq_by_turn:
+                faq_by_turn[a_t] = fd
 
         for target_it in target_items:
             target_turn = target_it["orig_turn"]
@@ -154,6 +186,40 @@ class ProgressiveContextSlicer:
                     except Exception:
                         pass
 
+            # 定位节点 ID（优先精确匹配 turn == target_turn，回退最近前置轮次）
+            resolved_node_id: Optional[str] = None
+            for t_num, nid_str in parsed_traj:
+                if t_num == target_turn:
+                    resolved_node_id = nid_str
+                    break
+                if t_num < target_turn:
+                    resolved_node_id = nid_str
+
+            # 定位 FAQ ID 与是否超纲（优先匹配 matched_deductions，回退查 faq_details）
+            resolved_faq_id: Optional[str] = None
+            resolved_is_faq_ood: bool = False
+            for md in matched_deductions:
+                cand_fid: str = str(md.get("matched_faq_id") or md.get("faq_id") or "").strip()
+                if not cand_fid:
+                    continue
+                if cand_fid.upper() == "FAQ_OOD":
+                    resolved_faq_id = "FAQ_OOD"
+                    resolved_is_faq_ood = True
+                elif cand_fid.upper() not in ("NONE", "NULL", "OOD"):
+                    resolved_faq_id = cand_fid
+                    resolved_is_faq_ood = False
+                    break
+            if not resolved_faq_id and target_turn in faq_by_turn:
+                fd_match = faq_by_turn[target_turn]
+                fd_fid: str = str(fd_match.get("matched_faq_id") or "").strip()
+                fd_ood: bool = bool(fd_match.get("is_ood", False)) or fd_fid.upper() == "FAQ_OOD"
+                if fd_ood:
+                    resolved_faq_id = "FAQ_OOD"
+                    resolved_is_faq_ood = True
+                elif fd_fid and fd_fid.upper() not in ("NONE", "NULL"):
+                    resolved_faq_id = fd_fid
+                    resolved_is_faq_ood = False
+
             # 扣分原因与评分细则组装
             if matched_deductions:
                 items_names = [str(d.get("item", "合规要素")).strip() for d in matched_deductions]
@@ -170,7 +236,7 @@ class ProgressiveContextSlicer:
             curr_regex_constraints = list(rule_regex_constraints)
             if rule and rule.inspection_rules and rule.inspection_rules.node_checkpoints:
                 for node_id, cp in rule.inspection_rules.node_checkpoints.items():
-                    if node_id in defect_item:
+                    if node_id in defect_item or (resolved_node_id and node_id == resolved_node_id):
                         f_kws = getattr(cp, "forbidden_keywords", None)
                         if isinstance(f_kws, list):
                             clean_kw = "|".join([str(k).strip() for k in f_kws if str(k).strip()])
@@ -238,6 +304,10 @@ class ProgressiveContextSlicer:
                 regex_constraints=curr_regex_constraints,
                 category=category,
                 sub_category=scenario.name if scenario else None,
+                rule_id=rule_id_val,
+                node_id=resolved_node_id,
+                faq_id=resolved_faq_id,
+                is_faq_ood=resolved_is_faq_ood,
             )
             slices.append(slice_obj)
 

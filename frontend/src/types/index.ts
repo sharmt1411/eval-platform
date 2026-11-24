@@ -185,6 +185,34 @@ export interface DatasetRecord {
   created_at?: number;
 }
 
+export interface DedupConfig {
+  enabled: boolean;
+  cluster_quota?: number | null;
+  answer_sim_threshold?: number;
+  near_dup_input_threshold?: number;
+  target_total_count?: number | null;
+}
+
+export interface DedupStats {
+  enabled: boolean;
+  input_candidates: number;
+  existing_count: number;
+  exact_hash_dropped: number;
+  near_dup_dropped: number;
+  replaced_existing_count: number;
+  cluster_count: number;
+  explicit_cluster_count: number;
+  implicit_cluster_count: number;
+  quota_dropped: number;
+  backfilled_count: number;
+  kept_candidates: number;
+  final_total_count: number;
+  cluster_quota?: number;
+  answer_sim_threshold?: number;
+  cache_hits?: number;
+  cache_misses?: number;
+}
+
 export interface DatasetImportRequest {
   dataset_id: string;
   dataset_type: 'benchmark' | 'flywheel_gold';
@@ -193,6 +221,7 @@ export interface DatasetImportRequest {
   content?: string;
   samples?: Record<string, any>[];
   source_file_path?: string;
+  dedup_config?: DedupConfig;
 }
 
 export type BenchmarkExportScope =
@@ -215,6 +244,7 @@ export interface BenchmarkExportFilterRequest {
   target_dataset_id?: string;
   target_dataset_name?: string;
   save_mode?: 'overwrite' | 'append';
+  dedup_config?: DedupConfig;
 }
 
 export interface BenchmarkExportPreviewResponse {
@@ -249,6 +279,7 @@ export interface BenchmarkFilteredExportResponse {
   export_scope: string;
   export_target: 'download' | 'save_dataset';
   sampling_stats: SamplingPreviewResponse;
+  dedup_stats?: DedupStats;
   jsonl_content?: string;
   saved_dataset?: DatasetRecord;
 }
@@ -324,6 +355,7 @@ export interface BenchmarkSample {
   rubric?: string | RubricConfig;
   regex_constraints?: string[];
   eval_tracker?: SampleEvalTracker;
+  metadata?: Record<string, any>;
 }
 
 export interface ModelEvalConfig {
@@ -504,6 +536,7 @@ export interface InspectionReport {
   deductions?: Array<{ item?: string; points?: number; reason?: string }>;
   node_trajectory: string[];
   trajectory_details?: TrajectoryDetailItem[];
+  faq_details?: Array<Record<string, any>>;
   topology_valid: boolean;
   topology_error?: string;
   flow_checkpoints: Record<string, any>;
@@ -577,6 +610,10 @@ export interface FlywheelBenchmarkSlice {
   regex_constraints: string[];
   category?: string;
   sub_category?: string;
+  rule_id?: string;
+  node_id?: string;
+  faq_id?: string;
+  is_faq_ood?: boolean;
 }
 
 export interface UpdateBenchmarkSlicesRequest {
@@ -589,6 +626,7 @@ export interface ExportBenchmarkDatasetRequest {
   name: string;
   slice_ids?: string[];
   mode?: 'create' | 'append';
+  dedup_config?: DedupConfig;
 }
 
 export interface BatchExportBenchmarkRequest {
@@ -597,6 +635,7 @@ export interface BatchExportBenchmarkRequest {
   name: string;
   mode?: 'create' | 'append';
   strategy?: 'all_defects' | 'primary_defect_only';
+  dedup_config?: DedupConfig;
 }
 
 export interface SampleReviewUpdateRequest {
@@ -613,6 +652,7 @@ export interface BatchFlywheelRunRequest {
   judge_model_id: string;
   remediate_model_id?: string;
   workers?: number;
+  dedup_config?: DedupConfig;
 }
 
 export interface ExportGoldDatasetRequest {
@@ -621,6 +661,9 @@ export interface ExportGoldDatasetRequest {
   include_manual_approved: boolean;
   inject_thinking: boolean;
   exclude_benchmark_exported?: boolean;
+  mode?: 'create' | 'append';
+  target_dataset_id?: string;
+  dedup_config?: DedupConfig;
 }
 
 export interface BatchUpdateStatusRequest {
@@ -653,6 +696,10 @@ export interface BatchExportSelectedRequest {
   sample_ids: string[];
   version_tag: string;
   inject_thinking: boolean;
+  exclude_benchmark_exported?: boolean;
+  mode?: 'create' | 'append';
+  target_dataset_id?: string;
+  dedup_config?: DedupConfig;
 }
 
 export interface DatasetInspectRequest {

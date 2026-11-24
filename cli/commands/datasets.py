@@ -71,6 +71,36 @@ def _build_export_filter_payload(
     return body
 
 
+def _merge_dedup_config(
+    body: Dict[str, Any],
+    *,
+    enable_dedup: Optional[bool],
+    cluster_quota: Optional[int],
+    sim_threshold: Optional[float],
+    target_count: Optional[int],
+) -> None:
+    """将 CLI 去重选项仅在显式传参时并入 body.dedup_config，防止覆盖 --payload 默认值。"""
+    if (
+        enable_dedup is None
+        and cluster_quota is None
+        and sim_threshold is None
+        and target_count is None
+    ):
+        return
+    cfg: Dict[str, Any] = dict(body.get("dedup_config") or {})
+    if enable_dedup is not None:
+        cfg["enabled"] = enable_dedup
+    else:
+        cfg.setdefault("enabled", True)
+    if cluster_quota is not None:
+        cfg["cluster_quota"] = cluster_quota
+    if sim_threshold is not None:
+        cfg["answer_sim_threshold"] = sim_threshold
+    if target_count is not None:
+        cfg["target_total_count"] = target_count
+    body["dedup_config"] = cfg
+
+
 @click.command("list")
 @click.pass_context
 def list_datasets_cmd(ctx: click.Context) -> None:
@@ -112,6 +142,10 @@ def dataset_samples_cmd(ctx: click.Context, dataset_id: str, limit: int) -> None
     help="导入模式",
 )
 @click.option("--mark-as-holdout/--no-mark-as-holdout", default=None, help="是否标记为纯评测留出题")
+@click.option("--enable-dedup/--no-dedup", default=None, help="是否启用去重与防稀释（append 默认开启）")
+@click.option("--cluster-quota", type=int, default=None, help="单簇保留上限 K")
+@click.option("--sim-threshold", type=float, default=None, help="同答/同复拆簇余弦相似度阈值 θ")
+@click.option("--target-count", type=int, default=None, help="可选目标总条数，未满时差异最大化补足")
 @click.option("--file", "local_file", default=None, help="读取本地 JSON/JSONL 文件内容导入")
 @click.option("--source-file-path", default=None, help="服务端本地外部文件路径")
 @click.option("--payload", "payload_file", default=None, help="完整导入请求 JSON 文件")
@@ -123,6 +157,10 @@ def import_dataset_cmd(
     dataset_type: Optional[str],
     mode: Optional[str],
     mark_as_holdout: Optional[bool],
+    enable_dedup: Optional[bool],
+    cluster_quota: Optional[int],
+    sim_threshold: Optional[float],
+    target_count: Optional[int],
     local_file: Optional[str],
     source_file_path: Optional[str],
     payload_file: Optional[str],
@@ -144,6 +182,13 @@ def import_dataset_cmd(
         overrides["content"] = p.read_text(encoding="utf-8")
 
     body = load_payload(payload_file, payload_json, overrides)
+    _merge_dedup_config(
+        body,
+        enable_dedup=enable_dedup,
+        cluster_quota=cluster_quota,
+        sim_threshold=sim_threshold,
+        target_count=target_count,
+    )
     if not body.get("dataset_id"):
         raise CliError("MISSING_PARAM", "导入数据集必须提供 --dataset-id", EXIT_API_ERROR)
     client = ensure_client(ctx)
@@ -237,6 +282,10 @@ def export_preview_cmd(
 @click.option("--target-dataset-id", default=None, help="另存为平台新评测集的 ID")
 @click.option("--target-dataset-name", default=None, help="另存为平台新评测集名称")
 @click.option("--save-mode", default=None, type=click.Choice(["overwrite", "append"]))
+@click.option("--enable-dedup/--no-dedup", default=None, help="是否启用去重与防稀释（append 默认开启）")
+@click.option("--cluster-quota", type=int, default=None, help="单簇保留上限 K")
+@click.option("--sim-threshold", type=float, default=None, help="同答拆簇余弦相似度阈值 θ")
+@click.option("--target-count", type=int, default=None, help="可选目标总题数，未满时差异最大化补足")
 @click.option("--save-jsonl", default=None, help="当 export-target=download 时将 jsonl_content 直接写入本地文件")
 @click.option("--sampling-json", default=None, help="完整 SamplingFilterConfig JSON")
 @click.option("--payload", "payload_file", default=None, help="完整请求 JSON 文件")
@@ -257,6 +306,10 @@ def export_dataset_cmd(
     target_dataset_id: Optional[str],
     target_dataset_name: Optional[str],
     save_mode: Optional[str],
+    enable_dedup: Optional[bool],
+    cluster_quota: Optional[int],
+    sim_threshold: Optional[float],
+    target_count: Optional[int],
     save_jsonl: Optional[str],
     sampling_json: Optional[str],
     payload_file: Optional[str],
@@ -283,6 +336,13 @@ def export_dataset_cmd(
         payload_file=payload_file,
         payload_json=payload_json,
         extra_overrides=extra,
+    )
+    _merge_dedup_config(
+        body,
+        enable_dedup=enable_dedup,
+        cluster_quota=cluster_quota,
+        sim_threshold=sim_threshold,
+        target_count=target_count,
     )
     client = ensure_client(ctx)
     data = client.request_json(

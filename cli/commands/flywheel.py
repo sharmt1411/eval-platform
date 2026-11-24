@@ -25,6 +25,36 @@ FLYWHEEL_STATUS_CHOICES = click.Choice(
 )
 
 
+def _merge_dedup_config(
+    body: Dict[str, Any],
+    *,
+    enable_dedup: Optional[bool],
+    cluster_quota: Optional[int],
+    sim_threshold: Optional[float],
+    target_count: Optional[int],
+) -> None:
+    """将 CLI 去重参数仅在显式传参时并入 body.dedup_config，防止覆盖 --payload 配置。"""
+    if (
+        enable_dedup is None
+        and cluster_quota is None
+        and sim_threshold is None
+        and target_count is None
+    ):
+        return
+    cfg: Dict[str, Any] = dict(body.get("dedup_config") or {})
+    if enable_dedup is not None:
+        cfg["enabled"] = enable_dedup
+    else:
+        cfg.setdefault("enabled", True)
+    if cluster_quota is not None:
+        cfg["cluster_quota"] = cluster_quota
+    if sim_threshold is not None:
+        cfg["answer_sim_threshold"] = sim_threshold
+    if target_count is not None:
+        cfg["target_total_count"] = target_count
+    body["dedup_config"] = cfg
+
+
 def _brief_flywheel_sample(item: Dict[str, Any]) -> Dict[str, Any]:
     init_eval = item.get("initial_eval") or {}
     ver_eval = item.get("verified_eval") or {}
@@ -84,6 +114,10 @@ def list_samples_cmd(
 @click.option("--gold-output-path", default=None, help="黄金 SFT 输出路径")
 @click.option("--discard-output-path", default=None, help="淘汰样本输出路径")
 @click.option("--workers", type=int, default=None, help="并发线程数")
+@click.option("--enable-dedup/--no-dedup", default=None, help="是否对导出黄金集启用去重防稀释")
+@click.option("--cluster-quota", type=int, default=None, help="单簇保留上限 K")
+@click.option("--sim-threshold", type=float, default=None, help="同复拆簇余弦相似度阈值 θ")
+@click.option("--target-count", type=int, default=None, help="可选目标总条数，未满时差异最大化补足")
 @click.option("--payload", "payload_file", default=None, help="完整 BatchFlywheelRunRequest JSON 文件")
 @click.option("--payload-json", default=None, help="完整 BatchFlywheelRunRequest JSON 字符串")
 @click.option("--wait", is_flag=True, help="提交后轮询等待直至批量飞轮治理完成")
@@ -99,6 +133,10 @@ def batch_flywheel_cmd(
     gold_output_path: Optional[str],
     discard_output_path: Optional[str],
     workers: Optional[int],
+    enable_dedup: Optional[bool],
+    cluster_quota: Optional[int],
+    sim_threshold: Optional[float],
+    target_count: Optional[int],
     payload_file: Optional[str],
     payload_json: Optional[str],
     wait: bool,
@@ -119,6 +157,13 @@ def batch_flywheel_cmd(
             "discard_output_path": discard_output_path,
             "workers": workers,
         },
+    )
+    _merge_dedup_config(
+        body,
+        enable_dedup=enable_dedup,
+        cluster_quota=cluster_quota,
+        sim_threshold=sim_threshold,
+        target_count=target_count,
     )
     for req_field in ("rule_id", "input_file_path", "judge_model_id"):
         if not body.get(req_field):
@@ -441,6 +486,12 @@ def update_slices_cmd(
 @click.option("--include-manual-approved/--no-include-manual-approved", default=True, show_default=True, help="是否包含人工批准样本")
 @click.option("--inject-thinking/--no-inject-thinking", default=False, show_default=True, help="是否在 assistant 中保留 thinking")
 @click.option("--exclude-benchmark-exported/--no-exclude-benchmark-exported", default=True, show_default=True, help="是否排除已导出进评测集的同源对话")
+@click.option("--mode", default=None, type=click.Choice(["create", "append"], case_sensitive=False), help="覆盖创建或追加合并")
+@click.option("--target-dataset-id", default=None, help="自定义目标数据集 ID")
+@click.option("--enable-dedup/--no-dedup", default=None, help="是否启用去重与防稀释")
+@click.option("--cluster-quota", type=int, default=None, help="单簇保留上限 K")
+@click.option("--sim-threshold", type=float, default=None, help="同复拆簇余弦相似度阈值 θ")
+@click.option("--target-count", type=int, default=None, help="可选目标总条数，未满时差异最大化补足")
 @click.pass_context
 def export_gold_cmd(
     ctx: click.Context,
@@ -449,20 +500,42 @@ def export_gold_cmd(
     include_manual_approved: bool,
     inject_thinking: bool,
     exclude_benchmark_exported: bool,
+    mode: Optional[str],
+    target_dataset_id: Optional[str],
+    enable_dedup: Optional[bool],
+    cluster_quota: Optional[int],
+    sim_threshold: Optional[float],
+    target_count: Optional[int],
 ) -> None:
-    """按规则导出达标黄金微调 SFT 数据集（Query 参数端点）"""
+    """按规则导出达标黄金微调 SFT 数据集"""
     check_command_allowed(ctx, "flywheel.export-gold")
+    query_params: Dict[str, Any] = {
+        "rule_id": rule_id,
+        "version_tag": version_tag,
+        "include_manual_approved": include_manual_approved,
+        "inject_thinking": inject_thinking,
+        "exclude_benchmark_exported": exclude_benchmark_exported,
+    }
+    body: Dict[str, Any] = {}
+    if mode is not None:
+        query_params["mode"] = mode
+        body["mode"] = mode
+    if target_dataset_id is not None:
+        query_params["target_dataset_id"] = target_dataset_id
+        body["target_dataset_id"] = target_dataset_id
+    _merge_dedup_config(
+        body,
+        enable_dedup=enable_dedup,
+        cluster_quota=cluster_quota,
+        sim_threshold=sim_threshold,
+        target_count=target_count,
+    )
     client = ensure_client(ctx)
     data = client.request_json(
         "POST",
         "/api/v1/flywheel/export",
-        params={
-            "rule_id": rule_id,
-            "version_tag": version_tag,
-            "include_manual_approved": include_manual_approved,
-            "inject_thinking": inject_thinking,
-            "exclude_benchmark_exported": exclude_benchmark_exported,
-        },
+        params=query_params,
+        json_body=body if body else None,
     )
     emit_output(ctx, data)
 
@@ -471,6 +544,13 @@ def export_gold_cmd(
 @click.option("--sample-id", "sample_ids", multiple=True, help="待导出样本 ID")
 @click.option("--version-tag", default=None, help="导出版本标签")
 @click.option("--inject-thinking/--no-inject-thinking", default=None, help="是否注入 thinking 字段")
+@click.option("--exclude-benchmark-exported/--no-exclude-benchmark-exported", default=None, help="是否排除已导出进评测集的同源对话")
+@click.option("--mode", default=None, type=click.Choice(["create", "append"], case_sensitive=False), help="覆盖创建或追加合并")
+@click.option("--target-dataset-id", default=None, help="自定义目标数据集 ID")
+@click.option("--enable-dedup/--no-dedup", default=None, help="是否启用去重与防稀释")
+@click.option("--cluster-quota", type=int, default=None, help="单簇保留上限 K")
+@click.option("--sim-threshold", type=float, default=None, help="同复拆簇余弦相似度阈值 θ")
+@click.option("--target-count", type=int, default=None, help="可选目标总条数，未满时差异最大化补足")
 @click.option("--payload", "payload_file", default=None, help="完整 BatchExportSelectedRequest JSON 文件")
 @click.option("--payload-json", default=None, help="完整 BatchExportSelectedRequest JSON 字符串")
 @click.pass_context
@@ -479,15 +559,35 @@ def export_selected_cmd(
     sample_ids: Tuple[str, ...],
     version_tag: Optional[str],
     inject_thinking: Optional[bool],
+    exclude_benchmark_exported: Optional[bool],
+    mode: Optional[str],
+    target_dataset_id: Optional[str],
+    enable_dedup: Optional[bool],
+    cluster_quota: Optional[int],
+    sim_threshold: Optional[float],
+    target_count: Optional[int],
     payload_file: Optional[str],
     payload_json: Optional[str],
 ) -> None:
     """将手动选定样本导出为标准 messages 数据集"""
     check_command_allowed(ctx, "flywheel.export-selected")
-    overrides: Dict[str, Any] = {"version_tag": version_tag, "inject_thinking": inject_thinking}
+    overrides: Dict[str, Any] = {
+        "version_tag": version_tag,
+        "inject_thinking": inject_thinking,
+        "exclude_benchmark_exported": exclude_benchmark_exported,
+        "mode": mode,
+        "target_dataset_id": target_dataset_id,
+    }
     if sample_ids:
         overrides["sample_ids"] = parse_str_list(sample_ids)
     body = load_payload(payload_file, payload_json, overrides)
+    _merge_dedup_config(
+        body,
+        enable_dedup=enable_dedup,
+        cluster_quota=cluster_quota,
+        sim_threshold=sim_threshold,
+        target_count=target_count,
+    )
     if not body.get("sample_ids"):
         raise CliError("MISSING_PARAM", "请提供 --sample-id 或 --payload", EXIT_API_ERROR)
     client = ensure_client(ctx)
@@ -501,6 +601,10 @@ def export_selected_cmd(
 @click.option("--name", default=None, help="目标评测集名称")
 @click.option("--slice-id", "slice_ids", multiple=True, help="仅导出指定 slice_id（不传则导出全部切片）")
 @click.option("--mode", default=None, type=click.Choice(["create", "append"], case_sensitive=False), help="新建覆盖或追加")
+@click.option("--enable-dedup/--no-dedup", default=None, help="是否启用去重与防稀释")
+@click.option("--cluster-quota", type=int, default=None, help="单簇保留上限 K")
+@click.option("--sim-threshold", type=float, default=None, help="同答拆簇余弦相似度阈值 θ")
+@click.option("--target-count", type=int, default=None, help="可选目标总题数，未满时差异最大化补足")
 @click.option("--payload", "payload_file", default=None, help="完整 ExportBenchmarkDatasetRequest JSON 文件")
 @click.option("--payload-json", default=None, help="完整 ExportBenchmarkDatasetRequest JSON 字符串")
 @click.pass_context
@@ -511,6 +615,10 @@ def export_benchmark_cmd(
     name: Optional[str],
     slice_ids: Tuple[str, ...],
     mode: Optional[str],
+    enable_dedup: Optional[bool],
+    cluster_quota: Optional[int],
+    sim_threshold: Optional[float],
+    target_count: Optional[int],
     payload_file: Optional[str],
     payload_json: Optional[str],
 ) -> None:
@@ -520,6 +628,13 @@ def export_benchmark_cmd(
     if slice_ids:
         overrides["slice_ids"] = parse_str_list(slice_ids)
     body = load_payload(payload_file, payload_json, overrides)
+    _merge_dedup_config(
+        body,
+        enable_dedup=enable_dedup,
+        cluster_quota=cluster_quota,
+        sim_threshold=sim_threshold,
+        target_count=target_count,
+    )
     if not body.get("dataset_id") or not body.get("name"):
         raise CliError("MISSING_PARAM", "请提供 --dataset-id 与 --name", EXIT_API_ERROR)
     client = ensure_client(ctx)
@@ -537,6 +652,10 @@ def export_benchmark_cmd(
 @click.option("--name", default=None, help="目标评测集名称")
 @click.option("--mode", default=None, type=click.Choice(["create", "append"], case_sensitive=False))
 @click.option("--strategy", default=None, type=click.Choice(["all_defects", "primary_defect_only"], case_sensitive=False))
+@click.option("--enable-dedup/--no-dedup", default=None, help="是否启用去重与防稀释")
+@click.option("--cluster-quota", type=int, default=None, help="单簇保留上限 K")
+@click.option("--sim-threshold", type=float, default=None, help="同答拆簇余弦相似度阈值 θ")
+@click.option("--target-count", type=int, default=None, help="可选目标总题数，未满时差异最大化补足")
 @click.option("--payload", "payload_file", default=None, help="完整 BatchExportBenchmarkRequest JSON 文件")
 @click.option("--payload-json", default=None, help="完整 BatchExportBenchmarkRequest JSON 字符串")
 @click.pass_context
@@ -547,6 +666,10 @@ def batch_export_benchmark_cmd(
     name: Optional[str],
     mode: Optional[str],
     strategy: Optional[str],
+    enable_dedup: Optional[bool],
+    cluster_quota: Optional[int],
+    sim_threshold: Optional[float],
+    target_count: Optional[int],
     payload_file: Optional[str],
     payload_json: Optional[str],
 ) -> None:
@@ -561,6 +684,13 @@ def batch_export_benchmark_cmd(
     if sample_ids:
         overrides["sample_ids"] = parse_str_list(sample_ids)
     body = load_payload(payload_file, payload_json, overrides)
+    _merge_dedup_config(
+        body,
+        enable_dedup=enable_dedup,
+        cluster_quota=cluster_quota,
+        sim_threshold=sim_threshold,
+        target_count=target_count,
+    )
     if not body.get("sample_ids") or not body.get("dataset_id") or not body.get("name"):
         raise CliError("MISSING_PARAM", "请提供 --sample-id、--dataset-id 与 --name", EXIT_API_ERROR)
     client = ensure_client(ctx)
