@@ -181,7 +181,7 @@ export interface DatasetRecord {
   name: string;
   file_path: string;
   sample_count: number;
-  dataset_type: 'benchmark' | 'flywheel_gold';
+  dataset_type: 'benchmark' | 'flywheel_gold' | 'flywheel_discarded';
   created_at?: number;
 }
 
@@ -585,6 +585,11 @@ export interface FlywheelSampleRecord {
   rule_id: string;
   scenario_id: string;
   status: FlywheelStatus;
+  raw_verdict?: 'UNJUDGED' | 'PASS' | 'FAIL' | 'ERROR';
+  remediated_verdict?: 'NONE' | 'UNVERIFIED' | 'PASS' | 'FAIL' | 'ERROR';
+  manual_decision?: 'NONE' | 'APPROVED' | 'REJECTED';
+  active_version?: 'raw' | 'remediated';
+  evaluated_rule_updated_at?: number | null;
   score: number;
   raw_messages: ChatMessage[];
   remediated_messages?: ChatMessage[] | null;
@@ -595,6 +600,8 @@ export interface FlywheelSampleRecord {
   remediation_debug?: DebugRequestEntry | null;
   reviewer_comment?: string;
   exported_to_benchmark?: boolean;
+  exported_training_datasets?: string[];
+  exported_benchmark_datasets?: string[];
   updated_at?: number;
 }
 
@@ -626,6 +633,8 @@ export interface ExportBenchmarkDatasetRequest {
   name: string;
   slice_ids?: string[];
   mode?: 'create' | 'append';
+  reserve_for_training?: boolean;
+  is_holdout?: boolean;
   dedup_config?: DedupConfig;
 }
 
@@ -635,11 +644,14 @@ export interface BatchExportBenchmarkRequest {
   name: string;
   mode?: 'create' | 'append';
   strategy?: 'all_defects' | 'primary_defect_only';
+  reserve_for_training?: boolean;
+  is_holdout?: boolean;
   dedup_config?: DedupConfig;
 }
 
 export interface SampleReviewUpdateRequest {
   status?: FlywheelStatus;
+  active_version?: 'raw' | 'remediated';
   remediated_messages?: ChatMessage[];
   reviewer_comment?: string;
 }
@@ -669,6 +681,7 @@ export interface ExportGoldDatasetRequest {
 export interface BatchUpdateStatusRequest {
   sample_ids: string[];
   status: FlywheelStatus;
+  active_version?: 'raw' | 'remediated';
   reviewer_comment?: string;
 }
 

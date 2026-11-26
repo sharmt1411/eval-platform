@@ -10,7 +10,7 @@ defaults:
 
 profiles:
   full:
-    description: "全能力模式：开放全部 8 个命令组共 61 条命令，供本机 Coding Agent 完整调度。"
+    description: "全能力模式：开放全部 8 个命令组共 60 条命令，供本机 Coding Agent 完整调度。"
     enabled_groups:
       - system
       - model
@@ -50,7 +50,6 @@ profiles:
     deny:
       - "*.delete"
       - "*.batch-delete"
-      - "simulation.clear-all"
       - "benchmark.reset-tracker"
     require_confirm_for_destructive: true
 
@@ -130,5 +129,4 @@ profiles:
     deny:
       - "*.delete"
       - "*.batch-delete"
-      - "simulation.clear-all"
     require_confirm_for_destructive: true

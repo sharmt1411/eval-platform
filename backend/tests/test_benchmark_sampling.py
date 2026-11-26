@@ -58,49 +58,54 @@ def test_target_interval_and_holdout_constraint():
 
 def test_partition_samples_three_pools_and_steady_quota():
     """测试三池分流、封顶保底、留出与普通题均支持降频过滤及稳态配额精准收敛 (100题 I=5 -> 精准抽出20题)"""
-    # 1. 混合池测试
+    # 1. 混合池测试 (通过 trackers_map 显式传入战绩，评测集文件本身不含/不采用 eval_tracker)
     samples = []
+    trackers_map = {}
     # 3道攻坚题 (c=0, 含留出题与普通题)
     for i in range(1, 4):
+        sid = f"q_active_{i}"
         samples.append(
             BenchmarkSample(
-                id=f"q_active_{i}",
+                id=sid,
                 is_holdout=(i != 3),
                 messages=[ChatMessage(role="user", content=f"攻坚问题 {i}")],
-                eval_tracker=SampleEvalTracker(consecutive_pass=0, miss_streak=0),
             )
         )
+        trackers_map[sid] = SampleEvalTracker(consecutive_pass=0, miss_streak=0)
     # 1道普通题触顶熟题 (is_holdout=False, c=6, m=4 -> m+1=5 >= N=5，普通题同样进熟题池并支持触顶保底)
     samples.append(
         BenchmarkSample(
             id="q_non_holdout_hardcap",
             is_holdout=False,
             messages=[ChatMessage(role="user", content="普通触顶熟题")],
-            eval_tracker=SampleEvalTracker(consecutive_pass=6, miss_streak=4),
         )
     )
+    trackers_map["q_non_holdout_hardcap"] = SampleEvalTracker(consecutive_pass=6, miss_streak=4)
     # 1道留出题触顶熟题 (is_holdout=True, c=6, m=4 -> m+1=5 >= N=5)
     samples.append(
         BenchmarkSample(
             id="q_hardcap_4",
             is_holdout=True,
             messages=[ChatMessage(role="user", content="留出触顶熟题")],
-            eval_tracker=SampleEvalTracker(consecutive_pass=6, miss_streak=4),
         )
     )
+    trackers_map["q_hardcap_4"] = SampleEvalTracker(consecutive_pass=6, miss_streak=4)
     # 5道常规熟题 (含留出题与普通题, c=3 -> I=2，并非每轮必出)
     for i in range(5, 10):
+        sid = f"q_cooldown_{i}"
         samples.append(
             BenchmarkSample(
-                id=f"q_cooldown_{i}",
+                id=sid,
                 is_holdout=(i % 2 == 1),
                 messages=[ChatMessage(role="user", content=f"冷却熟题 {i}")],
-                eval_tracker=SampleEvalTracker(consecutive_pass=3, miss_streak=(i % 2)),
             )
         )
+        trackers_map[sid] = SampleEvalTracker(consecutive_pass=3, miss_streak=(i % 2))
 
     config = SamplingFilterConfig(enabled=True, pass_threshold_x=3, interval_step_s=1, max_interval_n=5)
-    selected, skipped, stats = BenchmarkSamplingEngine.partition_samples(samples, config)
+    selected, skipped, stats = BenchmarkSamplingEngine.partition_samples(
+        samples, config, trackers_map=trackers_map
+    )
 
     selected_ids = {s.id for s in selected}
     skipped_ids = {s.id for s in skipped}
@@ -121,26 +126,35 @@ def test_partition_samples_three_pools_and_steady_quota():
 
     # 验证评测题型过滤 (holdout_filter)
     cfg_holdout_only = SamplingFilterConfig(enabled=True, pass_threshold_x=3, holdout_filter="holdout_only")
-    sel_h, skp_h, st_h = BenchmarkSamplingEngine.partition_samples(samples, cfg_holdout_only)
+    sel_h, skp_h, st_h = BenchmarkSamplingEngine.partition_samples(
+        samples, cfg_holdout_only, trackers_map=trackers_map
+    )
     assert st_h["total_samples"] == 6
     assert all(s.is_holdout for s in sel_h + skp_h)
 
     cfg_regular_only = SamplingFilterConfig(enabled=True, pass_threshold_x=3, holdout_filter="non_holdout_only")
-    sel_r, skp_r, st_r = BenchmarkSamplingEngine.partition_samples(samples, cfg_regular_only)
+    sel_r, skp_r, st_r = BenchmarkSamplingEngine.partition_samples(
+        samples, cfg_regular_only, trackers_map=trackers_map
+    )
     assert st_r["total_samples"] == 4
     assert all(not s.is_holdout for s in sel_r + skp_r)
 
     # 2. 稳态配额精确度验证: 100道全熟题 I=5 -> 精确抽 20 题
-    steady_samples = [
-        BenchmarkSample(
-            id=f"steady_{i}",
-            is_holdout=(i % 2 == 0),
-            messages=[ChatMessage(role="user", content=f"稳态题 {i}")],
-            eval_tracker=SampleEvalTracker(consecutive_pass=6, miss_streak=(i % 4)),
+    steady_samples = []
+    steady_trackers = {}
+    for i in range(100):
+        sid = f"steady_{i}"
+        steady_samples.append(
+            BenchmarkSample(
+                id=sid,
+                is_holdout=(i % 2 == 0),
+                messages=[ChatMessage(role="user", content=f"稳态题 {i}")],
+            )
         )
-        for i in range(100)
-    ]
-    sel_steady, skip_steady, st_steady = BenchmarkSamplingEngine.partition_samples(steady_samples, config)
+        steady_trackers[sid] = SampleEvalTracker(consecutive_pass=6, miss_streak=(i % 4))
+    sel_steady, skip_steady, st_steady = BenchmarkSamplingEngine.partition_samples(
+        steady_samples, config, trackers_map=steady_trackers
+    )
     assert len(sel_steady) == 20
     assert len(skip_steady) == 80
     assert st_steady["saved_compute_ratio"] == 80.0

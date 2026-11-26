@@ -299,24 +299,8 @@ def evaluate_dialogue_cmd(
     emit_output(ctx, data)
 
 
-@click.command("clear-all")
-@click.option("--rule-id", default=None, help="仅清空指定规则下的历史记录（不传则全部清空）")
-@click.pass_context
-def clear_all_cmd(ctx: click.Context, rule_id: Optional[str]) -> None:
-    """清空模拟对弈与飞轮样本历史记录"""
-    check_command_allowed(ctx, "simulation.clear-all")
-    client = ensure_client(ctx)
-    data = client.request_json(
-        "DELETE",
-        "/api/v1/simulation/battles/all",
-        params={"rule_id": rule_id},
-    )
-    emit_output(ctx, data)
-
-
 def register_commands(group: click.Group) -> None:
     group.add_command(run_sim_cmd)
     group.add_command(stream_sim_cmd)
     group.add_command(recent_sim_cmd)
     group.add_command(evaluate_dialogue_cmd)
-    group.add_command(clear_all_cmd)

@@ -23,7 +23,7 @@ flowchart TB
   sqlite_db[("SQLite 元数据库\ndata/eval_platform.db\nFlywheelSampleRecord/PromptTemplateRecord/RegisteredModel/RuleConfigRecord")]
 
   simulation -->|"SSE对弈/评估/历史"| api_sim
-  simulation -.->|"删除/Diff保存"| api_flywheel
+  simulation -.->|"Diff保存"| api_flywheel
   api_sim -->|"多轮双Agent对弈"| simulation_service
   api_sim -->|"自由对练初检"| judge_engine
   api_sim -.->|"auto_remediate委派"| flywheel_service

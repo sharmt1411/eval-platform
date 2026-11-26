@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 模拟对弈与人工自由测试 API
-专门承载双 Agent 模拟对弈（同步/SSE流式）、历史对弈会话查询/清空、以及人工自由对练白盒质检。
+专门承载双 Agent 模拟对弈（同步/SSE流式）、历史对弈会话只读回看、以及人工自由对练白盒质检。
 """
 import json
 import uuid
@@ -306,7 +306,7 @@ def list_recent_battles(
     limit: int = Query(default=50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    """查询最近执行的模拟对弈历史会话，供对弈台回放、切换与批量管理"""
+    """只读查询最近执行的模拟对弈历史会话，供对弈台回看与跳转飞轮样本池复核"""
     query = db.query(FlywheelSampleRecord)
     if rule_id and rule_id != "all":
         query = query.filter(FlywheelSampleRecord.rule_id == rule_id)
@@ -342,20 +342,6 @@ def list_recent_battles(
             "updated_at": r.updated_at,
         })
     return results
-
-
-@router.delete("/battles/all")
-def clear_all_battles(
-    rule_id: Optional[str] = None,
-    db: Session = Depends(get_db),
-):
-    """清空模拟对弈历史记录 (可根据 rule_id 过滤)"""
-    query = db.query(FlywheelSampleRecord)
-    if rule_id and rule_id != "all":
-        query = query.filter(FlywheelSampleRecord.rule_id == rule_id)
-    deleted_count = query.delete(synchronize_session=False)
-    db.commit()
-    return {"message": "历史对弈记录已清空", "deleted_count": deleted_count}
 
 
 @router.post("/evaluate-dialogue")

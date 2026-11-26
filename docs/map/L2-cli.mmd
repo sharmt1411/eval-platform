@@ -9,7 +9,7 @@
 flowchart TB
   cli["Agent CLI 入口\ncli/main.py\n含SKILL与兼容入口backend/cli.py"]
   cli_policy["命令权限策略引擎\ncli/policy.py\n读policy.default.yaml裁剪"]
-  cli_commands["全量命令组\ncli/commands\n8组61条命令"]
+  cli_commands["全量命令组\ncli/commands\n8组60条命令"]
   cli_client["平台薄HTTP客户端\ncli/client.py\nHTTP与ASGI双模"]
   fastapi_app["FastAPI 后端服务\nbackend/app/main.py"]
   api_models["模型管理路由\nbackend/app/api/models.py"]
@@ -29,5 +29,5 @@ flowchart TB
   cli_client -->|"prompt(5)"| api_prompts
   cli_client -->|"dataset(7)"| api_datasets
   cli_client -->|"benchmark(11)"| api_benchmarks
-  cli_client -->|"simulation(5)"| api_sim
+  cli_client -->|"simulation(4)"| api_sim
   cli_client -->|"flywheel(18)"| api_flywheel

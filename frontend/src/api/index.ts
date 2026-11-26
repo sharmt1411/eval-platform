@@ -316,13 +316,6 @@ export const simulationApi = {
     const res = await api.get<any[]>('/simulation/battles/recent', { params });
     return res.data;
   },
-  clearBattles: async (ruleId?: string) => {
-    const res = await api.delete<{ message: string; deleted_count: number }>(
-      '/simulation/battles/all',
-      { params: { rule_id: ruleId } }
-    );
-    return res.data;
-  },
   evaluateDialogue: async (data: {
     rule_id: string;
     scenario_id?: string;
@@ -364,10 +357,15 @@ export const flywheelApi = {
     return res.data;
   },
   updateSample: async (sampleId: string, data: SampleReviewUpdateRequest) => {
-    const res = await api.put<{ message: string; id: string; status: string }>(
-      `/flywheel/samples/${sampleId}`,
-      data
-    );
+    const res = await api.put<{
+      message: string;
+      id: string;
+      status: string;
+      raw_verdict?: string;
+      remediated_verdict?: string;
+      manual_decision?: string;
+      active_version?: 'raw' | 'remediated';
+    }>(`/flywheel/samples/${sampleId}`, data);
     return res.data;
   },
   remediateSample: async (
@@ -387,6 +385,10 @@ export const flywheelApi = {
       sample_id: string;
       rule_id?: string;
       status: string;
+      raw_verdict?: string;
+      remediated_verdict?: string;
+      manual_decision?: string;
+      active_version?: 'raw' | 'remediated';
       score: number;
       remediated_messages?: any[];
       initial_eval?: any;
@@ -409,6 +411,11 @@ export const flywheelApi = {
       sample_id: string;
       rule_id?: string;
       status: string;
+      raw_verdict?: string;
+      remediated_verdict?: string;
+      manual_decision?: string;
+      active_version?: 'raw' | 'remediated';
+      rule_changed?: boolean;
       score: number;
       target_data?: 'raw' | 'remediated';
       initial_eval?: any;

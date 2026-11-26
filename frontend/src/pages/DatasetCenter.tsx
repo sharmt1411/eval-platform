@@ -546,9 +546,10 @@ export const DatasetCenter: React.FC = () => {
     return <Tag color={color}>难度: {diff}</Tag>;
   };
 
-  // 区分过滤常规评测集 vs 训练对话集
+  // 区分过滤常规评测集 vs 训练对话集 vs 淘汰对话隔离池
   const benchmarkDatasets = datasets.filter((d) => d.dataset_type === 'benchmark');
-  const trainingDatasets = datasets.filter((d) => d.dataset_type !== 'benchmark');
+  const trainingDatasets = datasets.filter((d) => d.dataset_type === 'flywheel_gold');
+  const discardedDatasets = datasets.filter((d) => d.dataset_type === 'flywheel_discarded');
 
   const renderBenchmarkColumns = () => [
     {
@@ -698,6 +699,68 @@ export const DatasetCenter: React.FC = () => {
     },
   ];
 
+  const renderDiscardedColumns = () => [
+    {
+      title: '淘汰集标识 (ID)',
+      dataIndex: 'id',
+      width: 240,
+      render: (id: string) => <span className="font-mono text-xs font-semibold text-slate-800">{id}</span>,
+    },
+    {
+      title: '数据集名称 / 磁盘路径',
+      dataIndex: 'name',
+      render: (name: string, rec: DatasetRecord) => (
+        <div>
+          <div className="text-sm font-medium text-slate-800 flex items-center gap-1.5">
+            <span>{name}</span>
+            <Tag color="red" className="text-3xs">淘汰对话</Tag>
+          </div>
+          <div className="text-3xs text-slate-400 font-mono mt-0.5">{rec.file_path}</div>
+        </div>
+      ),
+    },
+    {
+      title: '会话总数',
+      dataIndex: 'sample_count',
+      width: 120,
+      render: (cnt: number) => (
+        <span className="font-bold text-sm text-rose-600">{cnt} 篇淘汰会话</span>
+      ),
+    },
+    {
+      title: '操作',
+      width: 300,
+      render: (_: any, record: DatasetRecord) => (
+        <Space size="small">
+          <Button
+            size="small"
+            type="primary"
+            ghost
+            icon={<AuditOutlined />}
+            onClick={() => openInspectModal(record)}
+          >
+            规则质检打分
+          </Button>
+          <Button
+            size="small"
+            icon={<EyeOutlined />}
+            onClick={() => handlePreview(record)}
+          >
+            抽检对话
+          </Button>
+          <Popconfirm
+            title={`确定要删除淘汰对话集 [${record.id}] 吗？`}
+            onConfirm={() => handleDeleteDataset(record.id)}
+            okText="确认删除"
+            cancelText="取消"
+          >
+            <Button size="small" danger icon={<DeleteOutlined />} />
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ];
+
   return (
     <div className="space-y-4">
       {/* 顶部操作栏 */}
@@ -706,7 +769,7 @@ export const DatasetCenter: React.FC = () => {
           <DatabaseOutlined className="text-blue-500 text-lg" />
           <span className="font-bold text-sm text-slate-800">平台数据资产中心</span>
           <span className="text-xs text-slate-400">
-            （双轨分类管理：常规/实战基准评测集 ∥ 飞轮产出的 SFT 微调黄金训练集）
+            （三轨分类管理：常规/实战基准评测集 ∥ SFT 微调训练集 ∥ 淘汰对话隔离池）
           </span>
         </div>
 
@@ -725,7 +788,7 @@ export const DatasetCenter: React.FC = () => {
         </Space>
       </div>
 
-      {/* 双 Tab 解耦展示 */}
+      {/* 三 Tab 解耦展示 */}
       <div className="bg-white rounded-lg border border-slate-200 shadow-2xs p-4">
         <Tabs
           activeKey={activeTab}
@@ -775,6 +838,31 @@ export const DatasetCenter: React.FC = () => {
                     dataSource={trainingDatasets}
                     pagination={false}
                     columns={renderTrainingColumns()}
+                  />
+                </div>
+              ),
+            },
+            {
+              key: 'discarded',
+              label: (
+                <span className="font-semibold text-xs flex items-center gap-1.5">
+                  <span>🗑️ 淘汰对话隔离池</span>
+                  <Tag color="red" className="ml-1 text-3xs font-mono">{discardedDatasets.length}</Tag>
+                </span>
+              ),
+              children: (
+                <div>
+                  <div className="mb-3 text-xs text-slate-500 bg-rose-50/60 p-2.5 rounded border border-rose-100 flex items-center justify-between flex-wrap gap-2">
+                    <span>
+                      ⚠️ 淘汰对话为批量治理未达标隔离样本，已与 SFT 训练集物理隔离（不提供 SFT 语料下载，不可直接跑常规评测）；支持抽检查看与按新规则重新执行「规则质检打分」。
+                    </span>
+                  </div>
+                  <Table
+                    rowKey="id"
+                    loading={loading}
+                    dataSource={discardedDatasets}
+                    pagination={false}
+                    columns={renderDiscardedColumns()}
                   />
                 </div>
               ),
@@ -1246,9 +1334,18 @@ export const DatasetCenter: React.FC = () => {
                   name="include_tracker"
                   label={<span className="text-3xs text-slate-700">附带 eval_tracker 战绩快照</span>}
                   valuePropName="checked"
+                  extra={
+                    watchedExportTarget === 'save_dataset' ? (
+                      <span className="text-3xs text-slate-400">另存为平台评测集时自动剥离战绩快照</span>
+                    ) : undefined
+                  }
                   className="m-0"
                 >
-                  <Switch checkedChildren="保留战绩字段" unCheckedChildren="纯净考题格式" />
+                  <Switch
+                    disabled={watchedExportTarget === 'save_dataset'}
+                    checkedChildren="保留战绩字段"
+                    unCheckedChildren="纯净考题格式"
+                  />
                 </Form.Item>
               </div>
             </div>

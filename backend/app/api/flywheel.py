@@ -9,7 +9,7 @@ import time
 import uuid
 import hashlib
 import threading
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple, Set, Literal
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Body
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
@@ -41,9 +41,18 @@ from backend.app.schemas.flywheel import (
     DatasetInspectRequest,
 )
 from backend.app.api.deps import (
+    add_dataset_to_sample_lineage,
+    ensure_sample_state_reconciled,
     get_adapter_and_config_by_model_id,
+    get_rule_threshold,
+    get_rule_updated_at,
+    get_sample_benchmark_datasets,
+    get_sample_training_datasets,
+    is_sample_exported_to_benchmark,
     load_rule_schema,
     messages_to_dicts,
+    sync_lineage_on_dataset_overwritten,
+    sync_lineage_on_dataset_removed,
     upsert_flywheel_sample,
 )
 from backend.app.services.flywheel_service import FlywheelPipelineService
@@ -53,7 +62,8 @@ router = APIRouter(prefix="/flywheel", tags=["数据飞轮治理"])
 
 
 class SampleReviewUpdateRequest(BaseModel):
-    status: Optional[str] = None  # GOLD_PASS / REPAIRED_PASS / DISCARDED / MANUAL_APPROVED
+    status: Optional[str] = None  # GOLD_PASS / REPAIRED_PASS / DISCARDED / MANUAL_APPROVED / PENDING
+    active_version: Optional[Literal["raw", "remediated"]] = None
     remediated_messages: Optional[List[Dict[str, Any]]] = None
     reviewer_comment: Optional[str] = None
 
@@ -99,13 +109,169 @@ def _parse_existing_initial_eval(sample: FlywheelSampleRecord) -> Optional[Inspe
     return None
 
 
+def _has_nonempty_messages_json(raw_json: Optional[str]) -> bool:
+    if not raw_json:
+        return False
+    try:
+        arr = json.loads(raw_json)
+        return isinstance(arr, list) and len(arr) > 0
+    except Exception:
+        return False
+
+
+def _serialize_flywheel_sample(
+    db: Session,
+    r: FlywheelSampleRecord,
+    threshold_cache: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    if threshold_cache is not None:
+        if r.rule_id not in threshold_cache:
+            threshold_cache[r.rule_id] = get_rule_threshold(db, r.rule_id)
+        th = threshold_cache[r.rule_id]
+    else:
+        th = get_rule_threshold(db, r.rule_id)
+    ensure_sample_state_reconciled(r, threshold=th)
+    return {
+        "id": r.id,
+        "task_id": r.task_id,
+        "rule_id": r.rule_id,
+        "scenario_id": r.scenario_id,
+        "status": r.status,
+        "raw_verdict": r.raw_verdict or "UNJUDGED",
+        "remediated_verdict": r.remediated_verdict or "NONE",
+        "manual_decision": r.manual_decision or "NONE",
+        "active_version": r.active_version or "raw",
+        "evaluated_rule_updated_at": r.evaluated_rule_updated_at,
+        "score": r.score,
+        "raw_messages": json.loads(r.raw_messages_json or "[]"),
+        "remediated_messages": json.loads(r.remediated_messages_json or "[]") if r.remediated_messages_json else None,
+        "initial_eval": json.loads(r.initial_eval_json or "{}"),
+        "verified_eval": json.loads(r.verified_eval_json or "{}"),
+        "remediation_debug": json.loads(r.remediation_debug_json or "{}") if getattr(r, "remediation_debug_json", None) else None,
+        "reviewer_comment": r.reviewer_comment,
+        "exported_to_benchmark": is_sample_exported_to_benchmark(r),
+        "exported_training_datasets": get_sample_training_datasets(r),
+        "exported_benchmark_datasets": get_sample_benchmark_datasets(r),
+        "updated_at": r.updated_at,
+    }
+
+
+def _apply_status_transition_for_sample(
+    db: Session,
+    sample: FlywheelSampleRecord,
+    target_status: Optional[str],
+    active_version: Optional[str],
+    reviewer_comment_incoming: Optional[str],
+    remediated_messages_edited: bool = False,
+    default_sys_cache: Optional[Dict[str, str]] = None,
+    allow_error_with_comment: bool = True,
+) -> None:
+    """统一执行单条或批量人工状态流转与版本/质检门禁校验。"""
+    ensure_sample_state_reconciled(sample, threshold=get_rule_threshold(db, sample.rule_id))
+    has_remed = _has_nonempty_messages_json(sample.remediated_messages_json)
+
+    def _get_default_sys(rid: str) -> str:
+        if default_sys_cache is not None and rid in default_sys_cache:
+            return default_sys_cache[rid]
+        try:
+            sys_txt = load_rule_schema(db, rid).bot_config.system_prompt
+        except Exception:
+            sys_txt = "你是专业的业务对话机器人。"
+        if default_sys_cache is not None:
+            default_sys_cache[rid] = sys_txt
+        return sys_txt
+
+    if active_version is not None:
+        if active_version == "remediated" and not has_remed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"样本 {sample.id} 尚无修复后对话，无法将生效版本切换为 remediated",
+            )
+        sample.active_version = active_version
+
+    if not target_status:
+        sample.status = FlywheelPipelineService.derive_sample_status(
+            sample.raw_verdict, sample.remediated_verdict, sample.manual_decision, sample.active_version
+        )
+        return
+
+    st = target_status.upper()
+    if st == "MANUAL_APPROVED":
+        has_valid_raw = (sample.raw_verdict in ("PASS", "FAIL"))
+        has_valid_remed = (sample.remediated_verdict in ("PASS", "FAIL"))
+        has_comment = bool((reviewer_comment_incoming if reviewer_comment_incoming is not None else sample.reviewer_comment or "").strip())
+
+        if sample.raw_verdict == "UNJUDGED" and not has_valid_remed and not remediated_messages_edited:
+            raise HTTPException(
+                status_code=400,
+                detail=f"样本 {sample.id} 尚未执行任何规则质检，禁止直接人工放行；请先执行规则质检",
+            )
+        if not has_valid_raw and not has_valid_remed:
+            if not allow_error_with_comment or (not has_comment and not remediated_messages_edited):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"样本 {sample.id} 质检异常或未完成有效质检（raw_verdict={sample.raw_verdict}），请先重检或在单条复核中填写备注/修订对话后再放行",
+                )
+
+        eff_active = active_version or ("remediated" if has_remed else "raw")
+        if eff_active == "remediated" and not has_remed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"样本 {sample.id} 指定生效版本为 remediated，但修复后对话为空",
+            )
+        msgs_raw = (
+            json.loads(sample.remediated_messages_json or "[]")
+            if eff_active == "remediated"
+            else json.loads(sample.raw_messages_json or "[]")
+        )
+        ok_fmt, fmt_err = FlywheelPipelineService.validate_manual_dialogue_messages(
+            msgs_raw, default_system_prompt=_get_default_sys(sample.rule_id)
+        )
+        if not ok_fmt:
+            raise HTTPException(
+                status_code=400,
+                detail=f"样本 {sample.id} ({eff_active}) 对话格式不合规，无法人工放行: {fmt_err}",
+            )
+        sample.active_version = eff_active
+        sample.manual_decision = "APPROVED"
+        rule_ts = get_rule_updated_at(db, sample.rule_id)
+        if rule_ts is not None:
+            sample.evaluated_rule_updated_at = rule_ts
+    elif st == "DISCARDED":
+        sample.manual_decision = "REJECTED"
+    elif st == "PENDING":
+        sample.manual_decision = "NONE"
+    elif st == "GOLD_PASS":
+        if sample.raw_verdict != "PASS":
+            raise HTTPException(
+                status_code=400,
+                detail=f"样本 {sample.id} 原对话未通过规则质检 (raw_verdict={sample.raw_verdict})，不能直接标为直通达标 (GOLD_PASS)；人工确认放行请使用 MANUAL_APPROVED",
+            )
+        sample.manual_decision = "NONE"
+        sample.active_version = "raw"
+    elif st == "REPAIRED_PASS":
+        if sample.remediated_verdict != "PASS":
+            raise HTTPException(
+                status_code=400,
+                detail=f"样本 {sample.id} 修复后对话未通过二次验收 (remediated_verdict={sample.remediated_verdict})，不能标为 REPAIRED_PASS；请先验收或使用 MANUAL_APPROVED",
+            )
+        sample.manual_decision = "NONE"
+        sample.active_version = "remediated"
+    else:
+        raise HTTPException(status_code=400, detail=f"不支持的样本状态 '{target_status}'")
+
+    sample.status = FlywheelPipelineService.derive_sample_status(
+        sample.raw_verdict, sample.remediated_verdict, sample.manual_decision, sample.active_version
+    )
+
+
 @router.post("/samples/batch-status")
 def batch_update_sample_status(
     payload: BatchUpdateStatusRequest,
     db: Session = Depends(get_db),
 ):
     """
-    批量更新选定样本的治理状态与评审备注
+    批量更新选定样本的治理状态与评审备注（校验人工放行必须具备有效质检与非空合规对话）
     """
     records = (
         db.query(FlywheelSampleRecord)
@@ -116,8 +282,18 @@ def batch_update_sample_status(
         raise HTTPException(status_code=404, detail="未找到指定的样本记录")
 
     now = int(time.time())
+    default_sys_cache: Dict[str, str] = {}
     for r in records:
-        r.status = payload.status
+        _apply_status_transition_for_sample(
+            db=db,
+            sample=r,
+            target_status=payload.status,
+            active_version=payload.active_version,
+            reviewer_comment_incoming=payload.reviewer_comment,
+            remediated_messages_edited=False,
+            default_sys_cache=default_sys_cache,
+            allow_error_with_comment=False,
+        )
         if payload.reviewer_comment is not None:
             r.reviewer_comment = payload.reviewer_comment
         r.updated_at = now
@@ -174,14 +350,21 @@ def batch_judge_samples(
         judge_config=judge_config,
     )
     threshold = rule.inspection_rules.pass_score_threshold
+    current_rule_ts = get_rule_updated_at(db, rule.rule_id)
 
     results = []
     notices: List[str] = []
     now = int(time.time())
 
     for sample in samples:
+        ensure_sample_state_reconciled(sample, threshold=threshold)
         old_status = sample.status
         old_score = sample.score
+        rule_changed = (sample.rule_id != rule.rule_id) or (
+            sample.evaluated_rule_updated_at is not None
+            and current_rule_ts is not None
+            and int(sample.evaluated_rule_updated_at) != int(current_rule_ts)
+        )
         sample.rule_id = rule.rule_id
 
         matched_sc = next(
@@ -193,11 +376,25 @@ def batch_judge_samples(
 
         try:
             eval_rep = pipeline.judge_dialogue(rule, matched_sc, raw_msgs)
-            new_status = FlywheelPipelineService.resolve_rejudge_status(
-                eval_rep, threshold, target_data="raw", current_status=old_status
+            has_remed = _has_nonempty_messages_json(sample.remediated_messages_json)
+            trans = FlywheelPipelineService.apply_rejudge_transition(
+                eval_report=eval_rep,
+                threshold=threshold,
+                target_data="raw",
+                raw_verdict=sample.raw_verdict or "UNJUDGED",
+                remediated_verdict=sample.remediated_verdict or "NONE",
+                manual_decision=sample.manual_decision or "NONE",
+                active_version=sample.active_version or "raw",
+                has_remediated_messages=has_remed,
+                rule_changed=rule_changed,
             )
 
-            sample.status = new_status
+            sample.raw_verdict = trans["raw_verdict"]
+            sample.remediated_verdict = trans["remediated_verdict"]
+            sample.manual_decision = trans["manual_decision"]
+            sample.active_version = trans["active_version"]
+            sample.status = trans["status"]
+            sample.evaluated_rule_updated_at = current_rule_ts
             sample.score = eval_rep.score
             sample.initial_eval_json = json.dumps(eval_rep.model_dump(), ensure_ascii=False)
             sample.updated_at = now
@@ -207,7 +404,12 @@ def batch_judge_samples(
             results.append({
                 "sample_id": sample.id,
                 "old_status": old_status,
-                "new_status": new_status,
+                "new_status": trans["status"],
+                "raw_verdict": trans["raw_verdict"],
+                "remediated_verdict": trans["remediated_verdict"],
+                "manual_decision": trans["manual_decision"],
+                "active_version": trans["active_version"],
+                "rule_changed": rule_changed,
                 "old_score": old_score,
                 "new_score": eval_rep.score,
                 "verdict": eval_rep.verdict,
@@ -371,6 +573,16 @@ def batch_remediate_samples(
             sample.benchmark_slices_json = json.dumps([s.model_dump() for s in updated_rec.benchmark_slices], ensure_ascii=False)
             sample.remediation_debug_json = json.dumps(updated_rec.remediation_debug or {}, ensure_ascii=False)
 
+            decoupled = FlywheelPipelineService.compute_record_decoupled_state(
+                updated_rec, threshold=rule.inspection_rules.pass_score_threshold
+            )
+            sample.raw_verdict = decoupled["raw_verdict"]
+            sample.remediated_verdict = decoupled["remediated_verdict"]
+            sample.manual_decision = decoupled["manual_decision"]
+            sample.active_version = decoupled["active_version"]
+            sample.status = decoupled["status"]
+            sample.evaluated_rule_updated_at = get_rule_updated_at(db, rule.rule_id)
+
             results.append({
                 "sample_id": sample.id,
                 "old_status": old_status,
@@ -411,16 +623,41 @@ def _export_training_rows_to_dataset(
     mode: str = "create",
     dedup_config: Optional[DedupConfig] = None,
 ) -> Tuple[int, Dict[str, Any]]:
-    """构建带轨迹/FAQ 元数据的候选对话，执行四步去重防稀释写盘并注册 DatasetRecord。"""
+    """
+    按 active_version 严格提取对应版本的对话，构建带轨迹/FAQ 元数据的候选行，
+    执行四步去重防稀释写盘、注册 DatasetRecord、回写样本池训练集留底，
+    并在存在已切题进过评测集的同源样本时原子改写对应评测集中的 is_holdout 为 False。
+    """
+    default_sys_cache: Dict[str, str] = {}
+    sample_by_id: Dict[str, FlywheelSampleRecord] = {}
     candidate_rows: List[Dict[str, Any]] = []
+
     for s in samples:
-        msgs = json.loads(s.remediated_messages_json or s.raw_messages_json or "[]")
-        clean_msgs: List[Dict[str, Any]] = []
-        for m in msgs:
-            entry: Dict[str, Any] = {"role": m.get("role"), "content": m.get("content")}
-            if inject_thinking and entry["role"] == "assistant":
-                entry["thinking"] = m.get("thinking", "")
-            clean_msgs.append(entry)
+        ensure_sample_state_reconciled(s, threshold=get_rule_threshold(db, s.rule_id))
+        sample_by_id[s.id] = s
+        if s.rule_id not in default_sys_cache:
+            try:
+                default_sys_cache[s.rule_id] = load_rule_schema(db, s.rule_id).bot_config.system_prompt
+            except Exception:
+                default_sys_cache[s.rule_id] = "你是专业的业务对话机器人。"
+        default_sys = default_sys_cache[s.rule_id]
+
+        raw_msgs = json.loads(s.raw_messages_json or "[]")
+        remed_msgs = json.loads(s.remediated_messages_json) if s.remediated_messages_json else None
+        eff_version = s.active_version or "raw"
+
+        ok_prep, clean_msgs, prep_err = FlywheelPipelineService.prepare_dialogue_for_training_export(
+            raw_messages=raw_msgs,
+            remediated_messages=remed_msgs,
+            active_version=eff_version,
+            default_system_prompt=default_sys,
+            inject_thinking=inject_thinking,
+        )
+        if not ok_prep:
+            raise HTTPException(
+                status_code=400,
+                detail=f"样本 {s.id} 按生效版本 ({eff_version}) 导出失败: {prep_err}",
+            )
 
         init_eval: Dict[str, Any] = {}
         ver_eval: Dict[str, Any] = {}
@@ -440,6 +677,8 @@ def _export_training_rows_to_dataset(
         candidate_rows.append({
             "id": s.id,
             "metadata": {
+                "source_sample_id": s.id,
+                "active_version": eff_version,
                 "rule_id": s.rule_id,
                 "scenario_id": s.scenario_id,
                 "status": s.status,
@@ -513,6 +752,57 @@ def _export_training_rows_to_dataset(
         ds_rec.sample_count = len(final_rows)
         ds_rec.dataset_type = "flywheel_gold"
         ds_rec.created_at = int(time.time())
+
+    # 回写训练集导出留底：仅记录去重防稀释后真正保留进目标文件的样本
+    if mode == "create":
+        sync_lineage_on_dataset_overwritten(
+            db=db,
+            dataset_id=dataset_id,
+            dataset_type="flywheel_gold",
+            final_rows=final_rows,
+            commit=False,
+        )
+    else:
+        for row in final_rows:
+            if not isinstance(row, dict):
+                continue
+            r_meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            src_sid = str(r_meta.get("source_sample_id") or row.get("id") or "").strip()
+            if src_sid in sample_by_id:
+                add_dataset_to_sample_lineage(sample_by_id[src_sid], dataset_id, "training")
+
+    # 联动改写：若本次真正保留进训练集的样本此前切题进过评测集，必须将其评测集同源题从留出题改写为普通题
+    retained_conflict_ids: Set[str] = set()
+    conflict_bench_ids: Set[str] = set()
+    for row in final_rows:
+        if not isinstance(row, dict):
+            continue
+        r_meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        src_sid = str(r_meta.get("source_sample_id") or row.get("id") or "").strip()
+        cand_s = sample_by_id.get(src_sid)
+        if cand_s is not None and is_sample_exported_to_benchmark(cand_s):
+            retained_conflict_ids.add(cand_s.id)
+            conflict_bench_ids.update(get_sample_benchmark_datasets(cand_s))
+
+    if retained_conflict_ids and conflict_bench_ids:
+        bench_paths: List[str] = []
+        bench_recs = (
+            db.query(DatasetRecord)
+            .filter(DatasetRecord.id.in_(list(conflict_bench_ids)))
+            .all()
+        )
+        found_ids: Set[str] = set()
+        for br in bench_recs:
+            found_ids.add(br.id)
+            if br.file_path:
+                bench_paths.append(br.file_path)
+        for bid in conflict_bench_ids:
+            if bid not in found_ids:
+                bench_paths.append(os.path.join(settings.DATASETS_DIR, f"{bid}.jsonl"))
+        FlywheelPipelineService.rewrite_benchmark_holdout_for_samples(
+            bench_paths, retained_conflict_ids
+        )
+
     db.commit()
 
     return len(final_rows), dedup_stats
@@ -524,8 +814,9 @@ def export_selected_samples(
     db: Session = Depends(get_db),
 ):
     """
-    从复核池中将选中的特定样本导出为标准 messages 格式的数据集 (.jsonl)，
-    默认排除已导出进评测集的留出题源对话，并应用去重防稀释。
+    从复核池中将选中的达标样本导出为标准 messages 格式的数据集 (.jsonl)，
+    统一校验样本必须达标（GOLD_PASS / REPAIRED_PASS / MANUAL_APPROVED），
+    默认排除已导出进评测集的留出题源对话（显式放行时同步把对应评测题改为普通题），并应用去重防稀释。
     """
     samples = (
         db.query(FlywheelSampleRecord)
@@ -535,8 +826,23 @@ def export_selected_samples(
     if not samples:
         raise HTTPException(status_code=400, detail="未找到选中的复核样本")
 
+    allowed_statuses = {"GOLD_PASS", "REPAIRED_PASS", "MANUAL_APPROVED"}
+    unqualified: List[str] = []
+    for s in samples:
+        ensure_sample_state_reconciled(s, threshold=get_rule_threshold(db, s.rule_id))
+        if (s.status or "PENDING") not in allowed_statuses:
+            unqualified.append(f"{s.id}({s.status})")
+    if unqualified:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "仅允许导出已达标或人工放行的对话（GOLD_PASS / REPAIRED_PASS / MANUAL_APPROVED），"
+                f"以下选中样本尚未达标: {', '.join(unqualified[:8])}"
+            ),
+        )
+
     if payload.exclude_benchmark_exported:
-        samples = [s for s in samples if not bool(s.exported_to_benchmark)]
+        samples = [s for s in samples if not is_sample_exported_to_benchmark(s)]
         if not samples:
             raise HTTPException(
                 status_code=400,
@@ -608,6 +914,18 @@ def judge_single_sample(
         judge_config=judge_config,
     )
     threshold = rule.inspection_rules.pass_score_threshold
+    ensure_sample_state_reconciled(sample, threshold=threshold)
+
+    is_remediated_target = (payload.target_data == "remediated")
+    if is_remediated_target and not _has_nonempty_messages_json(sample.remediated_messages_json):
+        raise HTTPException(status_code=400, detail="该样本尚无修复后对话，无法对修复版执行二次验收")
+
+    current_rule_ts = get_rule_updated_at(db, rule.rule_id)
+    rule_changed = (sample.rule_id != rule.rule_id) or (
+        sample.evaluated_rule_updated_at is not None
+        and current_rule_ts is not None
+        and int(sample.evaluated_rule_updated_at) != int(current_rule_ts)
+    )
 
     sample.rule_id = rule.rule_id
     matched_sc = next(
@@ -615,7 +933,6 @@ def judge_single_sample(
         PersonaDefinition(id=sample.scenario_id, name="复核样本场景", instruction="保持原意图"),
     )
 
-    is_remediated_target = (payload.target_data == "remediated")
     msgs_json = (
         sample.remediated_messages_json
         if is_remediated_target and sample.remediated_messages_json
@@ -624,15 +941,25 @@ def judge_single_sample(
     dialogue_msgs = [ChatMessage(**m) for m in json.loads(msgs_json or "[]")]
 
     eval_rep = pipeline.judge_dialogue(rule, matched_sc, dialogue_msgs)
-    new_status = FlywheelPipelineService.resolve_rejudge_status(
-        eval_rep,
-        threshold,
+    trans = FlywheelPipelineService.apply_rejudge_transition(
+        eval_report=eval_rep,
+        threshold=threshold,
         target_data=payload.target_data,
-        current_status=sample.status,
+        raw_verdict=sample.raw_verdict or "UNJUDGED",
+        remediated_verdict=sample.remediated_verdict or "NONE",
+        manual_decision=sample.manual_decision or "NONE",
+        active_version=sample.active_version or "raw",
+        has_remediated_messages=_has_nonempty_messages_json(sample.remediated_messages_json),
+        rule_changed=rule_changed,
     )
 
     now = int(time.time())
-    sample.status = new_status
+    sample.raw_verdict = trans["raw_verdict"]
+    sample.remediated_verdict = trans["remediated_verdict"]
+    sample.manual_decision = trans["manual_decision"]
+    sample.active_version = trans["active_version"]
+    sample.status = trans["status"]
+    sample.evaluated_rule_updated_at = current_rule_ts
     sample.score = eval_rep.score
     sample.updated_at = now
 
@@ -652,6 +979,11 @@ def judge_single_sample(
         "sample_id": sample_id,
         "rule_id": sample.rule_id,
         "status": sample.status,
+        "raw_verdict": sample.raw_verdict,
+        "remediated_verdict": sample.remediated_verdict,
+        "manual_decision": sample.manual_decision,
+        "active_version": sample.active_version,
+        "rule_changed": rule_changed,
         "score": sample.score,
         "target_data": payload.target_data,
         "initial_eval": json.loads(sample.initial_eval_json or "{}") if not is_remediated_target else None,
@@ -740,6 +1072,11 @@ def trigger_sample_remediation(
     sample.updated_at = int(time.time())
 
     if updated_rec.skipped_remediation:
+        if updated_rec.status == "GOLD_PASS":
+            sample.raw_verdict = "PASS"
+            sample.manual_decision = "NONE"
+            sample.active_version = "raw"
+            sample.evaluated_rule_updated_at = get_rule_updated_at(db, rule.rule_id)
         db.commit()
         existing_remed = (
             json.loads(sample.remediated_messages_json)
@@ -751,6 +1088,10 @@ def trigger_sample_remediation(
             "sample_id": sample_id,
             "rule_id": sample.rule_id,
             "status": sample.status,
+            "raw_verdict": sample.raw_verdict,
+            "remediated_verdict": sample.remediated_verdict,
+            "manual_decision": sample.manual_decision,
+            "active_version": sample.active_version,
             "score": sample.score,
             "remediated_messages": existing_remed,
             "initial_eval": json.loads(sample.initial_eval_json or "{}"),
@@ -778,6 +1119,15 @@ def trigger_sample_remediation(
     sample.applied_actions_json = json.dumps(updated_rec.applied_actions, ensure_ascii=False)
     sample.benchmark_slices_json = json.dumps([s.model_dump() for s in updated_rec.benchmark_slices], ensure_ascii=False)
     sample.remediation_debug_json = json.dumps(updated_rec.remediation_debug or {}, ensure_ascii=False)
+    decoupled = FlywheelPipelineService.compute_record_decoupled_state(
+        updated_rec, threshold=rule.inspection_rules.pass_score_threshold
+    )
+    sample.raw_verdict = decoupled["raw_verdict"]
+    sample.remediated_verdict = decoupled["remediated_verdict"]
+    sample.manual_decision = decoupled["manual_decision"]
+    sample.active_version = decoupled["active_version"]
+    sample.status = decoupled["status"]
+    sample.evaluated_rule_updated_at = get_rule_updated_at(db, rule.rule_id)
     db.commit()
 
     return {
@@ -785,6 +1135,10 @@ def trigger_sample_remediation(
         "sample_id": sample_id,
         "rule_id": sample.rule_id,
         "status": sample.status,
+        "raw_verdict": sample.raw_verdict,
+        "remediated_verdict": sample.remediated_verdict,
+        "manual_decision": sample.manual_decision,
+        "active_version": sample.active_version,
         "score": sample.score,
         "remediated_messages": remed_dicts,
         "initial_eval": json.loads(sample.initial_eval_json or "{}"),
@@ -864,6 +1218,9 @@ def trigger_batch_flywheel(
                         if f_rec.verified_eval
                         else (f_rec.initial_eval.score if f_rec.initial_eval else 0)
                     )
+                    decoupled = FlywheelPipelineService.compute_record_decoupled_state(
+                        f_rec, threshold=rule.inspection_rules.pass_score_threshold
+                    )
                     db_row, _ = upsert_flywheel_sample(
                         p_db,
                         sample_id=f_rec.id,
@@ -871,7 +1228,7 @@ def trigger_batch_flywheel(
                         task_id=task_id,
                         rule_id=rule.rule_id,
                         scenario_id=f_rec.scenario_id,
-                        status=f_rec.status,
+                        status=decoupled["status"],
                         score=final_score,
                         raw_messages=f_rec.raw_messages,
                         remediated_messages=f_rec.remediated_messages,
@@ -882,9 +1239,14 @@ def trigger_batch_flywheel(
                         verified_eval=f_rec.verified_eval.model_dump() if f_rec.verified_eval else {},
                         reviewer_comment=f"来自批量飞轮治理 ({task_id})",
                         updated_at=f_rec.updated_at,
+                        raw_verdict=decoupled["raw_verdict"],
+                        remediated_verdict=decoupled["remediated_verdict"],
+                        manual_decision=decoupled["manual_decision"],
+                        active_version=decoupled["active_version"],
+                        evaluated_rule_updated_at=get_rule_updated_at(p_db, rule.rule_id),
                         commit=True,
                     )
-                    return bool(db_row.exported_to_benchmark)
+                    return is_sample_exported_to_benchmark(db_row)
                 except Exception as exc:
                     p_db.rollback()
                     # 严禁吞错放行！先只读核查同规则下是否存在匹配的留出源样本，查不到或查库异常则直接抛出阻断写盘
@@ -924,7 +1286,7 @@ def trigger_batch_flywheel(
                 dedup_config=payload.dedup_config,
             )
 
-            # 同步注册黄金训练集至 DatasetRecord（含绝对路径/默认目录）
+            # 同步注册黄金训练集与淘汰对话集至 DatasetRecord（含绝对路径/默认目录）
             if os.path.exists(gold_out):
                 gold_cnt: int = int(stats.get("final_gold_count") or 0)
                 if gold_cnt > 0:
@@ -947,6 +1309,53 @@ def trigger_batch_flywheel(
                         ds_rec.sample_count = gold_cnt
                         ds_rec.dataset_type = "flywheel_gold"
                         ds_rec.created_at = int(time.time())
+                    gold_final_rows: List[Dict[str, Any]] = []
+                    with open(gold_out, "r", encoding="utf-8") as gf_r:
+                        for gln in gf_r:
+                            gs = gln.strip()
+                            if gs:
+                                try:
+                                    gobj = json.loads(gs)
+                                    if isinstance(gobj, dict):
+                                        gold_final_rows.append(gobj)
+                                except Exception:
+                                    pass
+                    sync_lineage_on_dataset_overwritten(
+                        db=bg_db,
+                        dataset_id=gold_did,
+                        dataset_type="flywheel_gold",
+                        final_rows=gold_final_rows,
+                        commit=False,
+                    )
+
+            if os.path.exists(discard_out):
+                discard_cnt = 0
+                with open(discard_out, "r", encoding="utf-8") as df:
+                    for line in df:
+                        if line.strip():
+                            discard_cnt += 1
+                if discard_cnt > 0:
+                    discard_fname: str = os.path.basename(discard_out)
+                    discard_did: str = (
+                        discard_fname[:-6] if discard_fname.endswith(".jsonl") else discard_fname
+                    )
+                    disc_rec = bg_db.query(DatasetRecord).filter(DatasetRecord.id == discard_did).first()
+                    if disc_rec is None:
+                        disc_rec = DatasetRecord(
+                            id=discard_did,
+                            name=discard_fname,
+                            file_path=discard_out,
+                            sample_count=discard_cnt,
+                            dataset_type="flywheel_discarded",
+                            created_at=int(time.time()),
+                        )
+                        bg_db.add(disc_rec)
+                    else:
+                        disc_rec.name = discard_fname
+                        disc_rec.file_path = discard_out
+                        disc_rec.sample_count = discard_cnt
+                        disc_rec.dataset_type = "flywheel_discarded"
+                        disc_rec.created_at = int(time.time())
 
             task.status = "COMPLETED"
             task.progress = 1.0
@@ -1125,6 +1534,11 @@ def inspect_dataset_by_rule(
                             initial_eval=rep.model_dump(),
                             reviewer_comment=f"来自数据集规则质检 ({resolved_dataset_id or task_id})",
                             updated_at=int(time.time()),
+                            raw_verdict="PASS" if fw_status == "GOLD_PASS" else "FAIL",
+                            remediated_verdict="NONE",
+                            manual_decision="NONE",
+                            active_version="raw",
+                            evaluated_rule_updated_at=get_rule_updated_at(p_db, rule.rule_id),
                             commit=False,
                         )
                         saved_count += 1
@@ -1252,25 +1666,8 @@ def list_flywheel_samples(
         query = query.filter(FlywheelSampleRecord.rule_id == rule_id)
 
     records = query.order_by(FlywheelSampleRecord.updated_at.desc()).limit(limit).all()
-    res = []
-    for r in records:
-        res.append({
-            "id": r.id,
-            "task_id": r.task_id,
-            "rule_id": r.rule_id,
-            "scenario_id": r.scenario_id,
-            "status": r.status,
-            "score": r.score,
-            "raw_messages": json.loads(r.raw_messages_json or "[]"),
-            "remediated_messages": json.loads(r.remediated_messages_json or "[]") if r.remediated_messages_json else None,
-            "initial_eval": json.loads(r.initial_eval_json or "{}"),
-            "verified_eval": json.loads(r.verified_eval_json or "{}"),
-            "remediation_debug": json.loads(r.remediation_debug_json or "{}") if getattr(r, "remediation_debug_json", None) else None,
-            "reviewer_comment": r.reviewer_comment,
-            "exported_to_benchmark": bool(r.exported_to_benchmark),
-            "updated_at": r.updated_at,
-        })
-    return res
+    threshold_cache: Dict[str, int] = {}
+    return [_serialize_flywheel_sample(db, r, threshold_cache=threshold_cache) for r in records]
 
 
 @router.put("/samples/{sample_id}")
@@ -1283,17 +1680,47 @@ def update_sample_review(
     if not sample:
         raise HTTPException(status_code=404, detail="未找到该样本")
 
-    if payload.status:
-        sample.status = payload.status
+    ensure_sample_state_reconciled(sample, threshold=get_rule_threshold(db, sample.rule_id))
+
+    remed_edited = False
     if payload.remediated_messages is not None:
-        sample.remediated_messages_json = json.dumps(payload.remediated_messages, ensure_ascii=False)
+        old_remed_json = sample.remediated_messages_json or "[]"
+        new_remed_json = json.dumps(payload.remediated_messages, ensure_ascii=False)
+        if new_remed_json != old_remed_json:
+            remed_edited = True
+        sample.remediated_messages_json = new_remed_json
         _refresh_sample_user_hashes(sample, remed_msgs=payload.remediated_messages)
+        if remed_edited:
+            sample.active_version = "remediated"
+            if (payload.status or "").upper() != "MANUAL_APPROVED":
+                sample.remediated_verdict = "UNVERIFIED"
+                if sample.manual_decision == "APPROVED":
+                    sample.manual_decision = "NONE"
+
+    _apply_status_transition_for_sample(
+        db=db,
+        sample=sample,
+        target_status=payload.status,
+        active_version=payload.active_version,
+        reviewer_comment_incoming=payload.reviewer_comment,
+        remediated_messages_edited=remed_edited,
+        allow_error_with_comment=True,
+    )
+
     if payload.reviewer_comment is not None:
         sample.reviewer_comment = payload.reviewer_comment
 
     sample.updated_at = int(time.time())
     db.commit()
-    return {"message": "样本复核更新成功", "id": sample_id, "status": sample.status}
+    return {
+        "message": "样本复核更新成功",
+        "id": sample_id,
+        "status": sample.status,
+        "raw_verdict": sample.raw_verdict,
+        "remediated_verdict": sample.remediated_verdict,
+        "manual_decision": sample.manual_decision,
+        "active_version": sample.active_version,
+    }
 
 
 @router.post("/export")
@@ -1308,21 +1735,29 @@ def export_gold_dataset(
     payload: Optional[ExportGoldOptionsBody] = Body(default=None),
     db: Session = Depends(get_db),
 ):
-    """从复核池中一键导出符合标准 messages 格式的黄金微调训练集 (.jsonl)，默认排除已进评测集的同源对话并去重防稀释"""
-    allowed_statuses = ["GOLD_PASS", "REPAIRED_PASS"]
+    """
+    从复核池中一键导出符合标准 messages 格式的黄金微调训练集 (.jsonl)，
+    统一仅导出达标对话、按 active_version 取对应版本对话，
+    默认排除已进评测集的同源对话（显式放行时同步把对应评测题改为普通题）并去重防稀释。
+    """
+    allowed_statuses = {"GOLD_PASS", "REPAIRED_PASS"}
     if include_manual_approved:
-        allowed_statuses.append("MANUAL_APPROVED")
+        allowed_statuses.add("MANUAL_APPROVED")
 
-    query = db.query(FlywheelSampleRecord).filter(
-        FlywheelSampleRecord.rule_id == rule_id,
-        FlywheelSampleRecord.status.in_(allowed_statuses),
+    rule_samples = (
+        db.query(FlywheelSampleRecord)
+        .filter(FlywheelSampleRecord.rule_id == rule_id)
+        .all()
     )
-    if exclude_benchmark_exported:
-        query = query.filter(
-            (FlywheelSampleRecord.exported_to_benchmark == False) | (FlywheelSampleRecord.exported_to_benchmark.is_(None))  # noqa: E712
-        )
-
-    samples = query.all()
+    th = get_rule_threshold(db, rule_id)
+    samples: List[FlywheelSampleRecord] = []
+    for s in rule_samples:
+        ensure_sample_state_reconciled(s, threshold=th)
+        if (s.status or "PENDING") not in allowed_statuses:
+            continue
+        if exclude_benchmark_exported and is_sample_exported_to_benchmark(s):
+            continue
+        samples.append(s)
 
     if not samples:
         raise HTTPException(status_code=400, detail="该规则下暂无可导出的达标黄金样本")
@@ -1403,12 +1838,39 @@ def _ensure_db_sample_slices(
     return slices_data, generated
 
 
+def _resolve_sample_benchmark_holdout(
+    sample: FlywheelSampleRecord,
+    reserve_for_training: bool = False,
+    explicit_is_holdout: Optional[bool] = None,
+) -> bool:
+    """
+    判定某条样本切题导出评测题时应写入的 is_holdout 标记:
+    - 若来源对话已进过训练集 (exported_training_datasets 非空): 严禁强标 is_holdout=True，强制标为普通题 (False);
+    - 若尚未进过训练集: 除非用户开启 reserve_for_training 或显式传 is_holdout=False，否则默认标为留出题 (True)。
+    """
+    train_ds = get_sample_training_datasets(sample)
+    if train_ds:
+        if explicit_is_holdout is True and not reserve_for_training:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"样本 {sample.id} 已导出至训练集 ({', '.join(train_ds)})，"
+                    "禁止强行标记为留出题 (is_holdout=True)，请以普通题导出"
+                ),
+            )
+        return False
+    if reserve_for_training or explicit_is_holdout is False:
+        return False
+    return True
+
+
 def _build_benchmark_rows_from_slices(
     sample_id: str,
     slices: List[Dict[str, Any]],
     rule_id: Optional[str] = None,
+    is_holdout: bool = True,
 ) -> List[Dict[str, Any]]:
-    """将飞轮评测切片字典列表转换为标准 Benchmark JSONL 行格式（保留定位元数据）。"""
+    """将飞轮评测切片字典列表转换为标准 Benchmark JSONL 行格式（保留定位元数据并如实写 is_holdout）。"""
     rows: List[Dict[str, Any]] = []
     for sl in slices:
         meta: Dict[str, Any] = {"source_sample_id": sample_id}
@@ -1430,7 +1892,7 @@ def _build_benchmark_rows_from_slices(
             "sub_category": sl.get("sub_category") or sl.get("defect_item"),
             "difficulty": "medium",
             "source": f"flywheel_{sample_id}",
-            "is_holdout": True,
+            "is_holdout": bool(is_holdout),
             "messages": sl["messages"],
             "reference": sl["reference"],
             "rubric": sl["rubric"],
@@ -1449,7 +1911,7 @@ def _write_and_register_benchmark_dataset(
     exported_samples: List[FlywheelSampleRecord],
     dedup_config: Optional[DedupConfig] = None,
 ) -> Tuple[str, int, Dict[str, Any]]:
-    """合并写入 Benchmark JSONL 文件（接入四步去重防稀释）、注册 DatasetRecord 并精准锁定留出源样本。"""
+    """合并写入 Benchmark JSONL 文件（接入四步去重防稀释）、注册 DatasetRecord 并回写评测集导出留底。"""
     file_path = os.path.join(settings.DATASETS_DIR, f"{dataset_id}.jsonl")
 
     existing_rows: Optional[List[Dict[str, Any]]] = None
@@ -1513,7 +1975,10 @@ def _write_and_register_benchmark_dataset(
         ds_record.sample_count = len(final_rows)
         ds_record.dataset_type = "benchmark"
 
-    # 源头互斥锁定: 仅对最终保留至少 1 道评测题的源样本置位 exported_to_benchmark = True
+    if mode == "create":
+        sync_lineage_on_dataset_removed(db, dataset_id, commit=False)
+
+    # 仅对去重后最终保留至少 1 道评测题的源样本记录 exported_benchmark_datasets 与 exported_to_benchmark
     retained_sources: Set[str] = set()
     retained_ids: Set[str] = set()
     for r in final_rows:
@@ -1539,7 +2004,7 @@ def _write_and_register_benchmark_dataset(
             except Exception:
                 has_slice_kept = False
         if has_slice_kept:
-            s.exported_to_benchmark = True
+            add_dataset_to_sample_lineage(s, dataset_id, "benchmark")
             s.updated_at = now_ts
 
     db.commit()
@@ -1597,9 +2062,19 @@ def update_sample_slices(sample_id: str, payload: UpdateBenchmarkSlicesRequest, 
         if updated_actions:
             sample.applied_actions_json = json.dumps(updated_actions, ensure_ascii=False)
         if sanitized_msgs is not None:
+            ensure_sample_state_reconciled(sample, threshold=rule.inspection_rules.pass_score_threshold)
             sanitized_dicts: List[Dict[str, Any]] = messages_to_dicts(sanitized_msgs)
             sample.remediated_messages_json = json.dumps(sanitized_dicts, ensure_ascii=False)
             _refresh_sample_user_hashes(sample, raw_msgs=raw_msgs, remed_msgs=sanitized_msgs)
+            sample.active_version = "remediated"
+            if (sample.remediated_verdict or "NONE") == "NONE":
+                sample.remediated_verdict = "UNVERIFIED"
+            sample.status = FlywheelPipelineService.derive_sample_status(
+                sample.raw_verdict,
+                sample.remediated_verdict,
+                sample.manual_decision,
+                sample.active_version,
+            )
 
     sample.updated_at = int(time.time())
     db.commit()
@@ -1612,7 +2087,7 @@ def export_single_sample_benchmark(
     payload: ExportBenchmarkDatasetRequest,
     db: Session = Depends(get_db),
 ):
-    """将单个样本的切片导出为标准 Benchmark 评测集文件并在 datasets 表中注册"""
+    """将单个样本的切片导出为标准 Benchmark 评测集文件并在 datasets 表中注册（按训练集留底如实标 is_holdout）"""
     sample = db.query(FlywheelSampleRecord).filter(FlywheelSampleRecord.id == sample_id).first()
     if not sample:
         raise HTTPException(status_code=404, detail="未找到该样本")
@@ -1632,9 +2107,16 @@ def export_single_sample_benchmark(
     if not selected_slices:
         raise HTTPException(status_code=400, detail="未选定任何有效切片")
 
+    sample_is_holdout = _resolve_sample_benchmark_holdout(
+        sample,
+        reserve_for_training=bool(payload.reserve_for_training),
+        explicit_is_holdout=payload.is_holdout,
+    )
     dataset_id = payload.dataset_id.strip() or f"flywheel_{sample_id}_eval"
     dataset_name = payload.name.strip() or f"飞轮样本评测集 ({sample_id})"
-    bench_rows = _build_benchmark_rows_from_slices(sample_id, selected_slices, rule_id=sample.rule_id)
+    bench_rows = _build_benchmark_rows_from_slices(
+        sample_id, selected_slices, rule_id=sample.rule_id, is_holdout=sample_is_holdout
+    )
 
     file_path, sample_count, dedup_stats = _write_and_register_benchmark_dataset(
         db=db,
@@ -1647,10 +2129,15 @@ def export_single_sample_benchmark(
     )
 
     return {
-        "message": "评测集导出成功（已标记为纯评测留出集并与训练集隔离）",
+        "message": (
+            "评测集导出成功（已标记为纯评测留出题并与训练集隔离）"
+            if sample_is_holdout
+            else "评测集导出成功（已如实标记为普通题 is_holdout=False）"
+        ),
         "dataset_id": dataset_id,
         "file_path": file_path,
         "sample_count": sample_count,
+        "is_holdout": sample_is_holdout,
         "dedup_stats": dedup_stats,
     }
 
@@ -1660,7 +2147,7 @@ def batch_export_benchmark_dataset(
     payload: BatchExportBenchmarkRequest,
     db: Session = Depends(get_db),
 ):
-    """批量将多个勾选样本的切片合并导出为标准 Benchmark 评测集"""
+    """批量将多个勾选样本的切片合并导出为标准 Benchmark 评测集（逐条按训练集留底如实标 is_holdout）"""
     samples = db.query(FlywheelSampleRecord).filter(FlywheelSampleRecord.id.in_(payload.sample_ids)).all()
     if not samples:
         raise HTTPException(status_code=404, detail="未找到选中的任何样本")
@@ -1671,18 +2158,34 @@ def batch_export_benchmark_dataset(
     all_bench_rows: List[Dict[str, Any]] = []
     exported_samples: List[FlywheelSampleRecord] = []
     rule_cache: Dict[str, UniversalRuleSchema] = {}
+    holdout_count = 0
+    regular_count = 0
 
     for s in samples:
         slices_raw, _ = _ensure_db_sample_slices(db, s, rule_cache=rule_cache)
         if not slices_raw:
             continue
 
+        sample_is_holdout = _resolve_sample_benchmark_holdout(
+            s,
+            reserve_for_training=bool(payload.reserve_for_training),
+            explicit_is_holdout=payload.is_holdout,
+        )
+        if sample_is_holdout:
+            holdout_count += 1
+        else:
+            regular_count += 1
+
         target_slices = (
             [slices_raw[0]]
             if payload.strategy == "primary_defect_only"
             else slices_raw
         )
-        all_bench_rows.extend(_build_benchmark_rows_from_slices(s.id, target_slices, rule_id=s.rule_id))
+        all_bench_rows.extend(
+            _build_benchmark_rows_from_slices(
+                s.id, target_slices, rule_id=s.rule_id, is_holdout=sample_is_holdout
+            )
+        )
         exported_samples.append(s)
 
     if not all_bench_rows:
@@ -1699,9 +2202,11 @@ def batch_export_benchmark_dataset(
     )
 
     return {
-        "message": "批量导出评测集成功（已锁定源样本不进训练集）",
+        "message": f"批量导出评测集成功（留出题源 {holdout_count} 条，普通题源 {regular_count} 条）",
         "dataset_id": dataset_id,
         "file_path": file_path,
         "sample_count": sample_count,
+        "holdout_source_count": holdout_count,
+        "regular_source_count": regular_count,
         "dedup_stats": dedup_stats,
     }

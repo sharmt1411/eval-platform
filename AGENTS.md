@@ -42,7 +42,7 @@ eval-platform/
 │   ├── __init__.py                                # CLI 包版本定义
 │   ├── __main__.py                                # python -m cli 调度入口
 │   ├── config.py                                  # 运行时配置、环境变量与统一退出码 (0/1/2/3/4)
-│   ├── catalog.py                                 # 全量 8 组 61 条命令目录契约（覆盖全部 59 条后端 API）
+│   ├── catalog.py                                 # 全量 8 组 60 条命令目录契约（覆盖全部 58 条后端 API）
 │   ├── policy.py                                  # 命令可见性与权限策略引擎（Profile/通配符黑白名单/风险分级/二次确认）
 │   ├── policy.default.yaml                        # 默认策略配置与 5 套预设 Profile (full/safe/readonly/eval-loop/flywheel-loop)
 │   ├── client.py                                  # 平台薄客户端（默认 HTTP/SSE 直连后端，可选 --in-process ASGI 直调）
@@ -57,7 +57,7 @@ eval-platform/
 │       ├── prompts.py                             # list / get / save / reset / preview (5)
 │       ├── datasets.py                            # list / samples / import / delete / filter-options / export-preview / export (7)
 │       ├── benchmarks.py                          # run / tasks / status / side-by-side / delete / batch-delete / revoke-ledger / preview-sampling / reset-tracker / debug-judge / test-judge (11)
-│       ├── simulation.py                          # run / stream / recent / evaluate / clear-all (5)
+│       ├── simulation.py                          # run / stream / recent / evaluate (4)
 │       └── flywheel.py                            # samples / batch / inspect-dataset / inspect-report / judge / batch-judge / remediate / batch-remediate / update / batch-status / delete / batch-delete / slices-get / slices-update / export-gold / export-selected / export-benchmark / batch-export-benchmark (18)
 ├── docs/                                          # [统一设计与规范文档库]
 │   ├── DESIGN_PLAN.md                             # [架构方案] 通用测试管理与数据飞轮平台完整设计方案说明书
@@ -93,7 +93,10 @@ eval-platform/
 │       │   ├── 2026-11-19-agent_cli_platform.mmd  # 本机 Coding Agent CLI 与可配置命令治理方案/变更图
 │       │   ├── 2026-11-19-dataset_rule_inspection.mmd # 纯对话数据集批量规则质检打分与评测边界治理方案/变更图
 │       │   ├── 2026-11-23-holdout_decouple_and_passrate_breakdown.mmd # 题型Holdout与学会遗忘降频解耦及报告分层通过率变更图
-│       │   └── 2026-11-24-dataset_dedup_and_diversity.mmd # 数据集去重防稀释与规则隔离变更图
+│       │   ├── 2026-11-24-dataset_dedup_and_diversity.mmd # 数据集去重防稀释与规则隔离变更图
+│       │   ├── 2026-11-25-dataflow_group1_fixes.mmd       # 数据流第一组五项修复变更图
+│       │   ├── 2026-11-25-plan_export_lineage_holdout.mmd # 样本池导出留底与留出/普通题如实标记变更图
+│       │   └── 2026-11-25-plan_sample_status_decouple.mmd # 样本池质检修复与人工结论状态解耦变更图
 │       └── facts/                                 # [自动落盘事实库] 供 AI 与开发者查漏的持久化真相清单
 │           ├── FACTS.md                           # 可读性事实清单（切片总表、依赖图、事件链、外网直连、盲区）
 │           └── facts.json                         # 结构化机器事实（供 build.py 校验与下游读取）
@@ -102,7 +105,7 @@ eval-platform/
 │   ├── requirements.txt                           # 后端依赖清单 (fastapi, uvicorn, sqlalchemy, httpx 等)
 │   ├── tests/                                     # [API 与引擎回归测试集]
 │   │   ├── __init__.py                            # 测试包初始化
-│   │   ├── test_agent_cli.py                      # Agent CLI 全量 61 命令、可配置策略裁剪与隔离端到端回归测试
+│   │   ├── test_agent_cli.py                      # Agent CLI 全量 60 命令、可配置策略裁剪与隔离端到端回归测试
 │   │   ├── test_api.py                            # API 全链路与矩阵评测/任务删除/API异常隔离/飞轮对弈回归测试
 │   │   ├── test_architecture.py                   # 架构守护断言测试(防胖路由/越级调引擎/聚合导入/外网直连/循环依赖)
 │   │   ├── test_dataset_rule_inspection.py        # 纯对话数据集批量规则质检打分与常规评测无标尺拦截回归测试
@@ -120,7 +123,8 @@ eval-platform/
 │   │   ├── test_prompt_center.py                  # 全平台提示词管理中心CRUD、引擎生效优先级与在线实测回归测试
 │   │   ├── test_openai_harmony_streaming.py       # OpenAIAdapter与HarmonyAdapter默认SSE流式保活与兼容降级测试
 │   │   ├── test_vertex_adaptive_thinking.py       # Vertex模型思考协议自适应探测与MaaS持久化路由回归测试
-│   │   └── test_dataset_deduplication.py          # 全平台数据集去重与防稀释十大核心场景回归测试
+│   │   ├── test_dataset_deduplication.py          # 全平台数据集去重与防稀释十大核心场景回归测试
+│   │   └── test_dataflow_fixes.py                 # 数据流全两阶段七项修复全隔离回归与存量迁移测试
 │   └── app/
 │       ├── main.py                                # FastAPI 服务入口 (挂载 /api/v1 路由, CORS, /health)
 │       ├── config.py                              # 全局路径、数据库 URL 与环境配置

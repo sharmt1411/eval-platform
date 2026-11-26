@@ -1,0 +1,12 @@
+%% title: 样本池质检修复与人工结论状态解耦变更图
+flowchart LR
+  ui_fw["飞轮复核台\nfrontend/src/pages/FlywheelWorkbench.tsx\n展示三结论与生效版本选择"]:::changed
+  api_fw["飞轮API路由\nbackend/app/api/flywheel.py\n重检校验规则并按生效版导出"]:::changed
+  api_deps["路由公共助手\nbackend/app/api/deps.py\n规则时间戳感知与状态对账"]:::changed
+  fw_svc["飞轮编排服务\nbackend/app/services/flywheel_service.py:FlywheelPipelineService\n解耦状态机与按版清洗导出"]:::changed
+  orm_fw[("飞轮样本表\nbackend/app/models/base.py:FlywheelSampleRecord\n拆分三结论生效版与迁移")]:::added
+
+  ui_fw -->|"重检重修与人工放行"| api_fw
+  api_fw -->|"取规则时间与对账"| api_deps
+  api_fw -->|"重检状态机与按版清洗"| fw_svc
+  api_deps -->|"读写三结论与生效版"| orm_fw

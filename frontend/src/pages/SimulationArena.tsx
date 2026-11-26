@@ -147,13 +147,11 @@ export const SimulationArena: React.FC = () => {
   const [playgroundSavedSampleId, setPlaygroundSavedSampleId] = useState<string>('');
 
   // ---------------------------------------------------------------------------
-  // Tab 3: 历史会话批量管理状态
+  // Tab 3: 对练历史只读回看状态
   // ---------------------------------------------------------------------------
   const [historyBattles, setHistoryBattles] = useState<any[]>([]);
   const [historyLoading, setHistoryLoading] = useState<boolean>(false);
   const [historyStatusFilter, setHistoryStatusFilter] = useState<string>('all');
-  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
-  const [historyBatchDeleting, setHistoryBatchDeleting] = useState<boolean>(false);
   const [historyPagination, setHistoryPagination] = useState<{ current: number; pageSize: number }>({
     current: 1,
     pageSize: 20,
@@ -569,35 +567,8 @@ export const SimulationArena: React.FC = () => {
   };
 
   // ---------------------------------------------------------------------------
-  // Tab 3 操作：历史会话批量管理
+  // Tab 3 操作：对练历史回看
   // ---------------------------------------------------------------------------
-  const handleBatchDeleteSelected = async () => {
-    if (selectedRowKeys.length === 0) return;
-    setHistoryBatchDeleting(true);
-    try {
-      const ids = selectedRowKeys.map(String);
-      const res = await flywheelApi.batchDeleteSamples(ids);
-      message.success(`已批量删除 ${res.deleted_count} 条对弈记录！`);
-      setSelectedRowKeys([]);
-      loadHistoryBattles(selectedRuleId, historyStatusFilter);
-    } catch (e: any) {
-      message.error(`批量删除失败: ${e.message}`);
-    } finally {
-      setHistoryBatchDeleting(false);
-    }
-  };
-
-  const handleClearAllHistory = async () => {
-    try {
-      const res = await simulationApi.clearBattles(selectedRuleId);
-      message.success(`已清空当前规则全部历史记录 (${res.deleted_count} 条)`);
-      setSelectedRowKeys([]);
-      loadHistoryBattles(selectedRuleId, historyStatusFilter);
-    } catch (e: any) {
-      message.error(`清空失败: ${e.message}`);
-    }
-  };
-
   const handleLoadBattleToArena = (record: any) => {
     setBattleResults([record]);
     setActiveBattleIndex(0);
@@ -706,7 +677,7 @@ export const SimulationArena: React.FC = () => {
     {
       title: '操作',
       key: 'action',
-      width: 200,
+      width: 170,
       render: (_, record) => (
         <Space size="small">
           <Button
@@ -727,20 +698,6 @@ export const SimulationArena: React.FC = () => {
           >
             复核
           </Button>
-          <Popconfirm
-            title="确认删除该条对弈记录？"
-            onConfirm={async () => {
-              try {
-                await flywheelApi.deleteSample(record.sample_id);
-                message.success('已删除');
-                loadHistoryBattles(selectedRuleId, historyStatusFilter);
-              } catch (e: any) {
-                message.error(`删除失败: ${e.message}`);
-              }
-            }}
-          >
-            <Button size="small" danger icon={<DeleteOutlined />} />
-          </Popconfirm>
         </Space>
       ),
     },
@@ -802,7 +759,7 @@ export const SimulationArena: React.FC = () => {
                 key: 'history',
                 label: (
                   <span>
-                    <HistoryOutlined /> 历史会话批量管理 ({historyBattles.length})
+                    <HistoryOutlined /> 对练历史回看 ({historyBattles.length})
                   </span>
                 ),
               },
@@ -1021,7 +978,7 @@ export const SimulationArena: React.FC = () => {
                   icon={<HistoryOutlined />}
                   onClick={() => setActiveTab('history')}
                 >
-                  历史管理 ({historyBattles.length})
+                  对练历史 ({historyBattles.length})
                 </Button>
               </div>
 
@@ -1653,7 +1610,7 @@ export const SimulationArena: React.FC = () => {
       )}
 
       {/* ========================================================================= */}
-      {/* TAB 3: 📋 历史会话批量管理视图 (展示是展示，测试是测试)                     */}
+      {/* TAB 3: 📋 对练历史只读回看视图 (样本删改统一归数据飞轮工作台)                  */}
       {/* ========================================================================= */}
       {activeTab === 'history' && (
         <Card size="small" className="shadow-2xs border-slate-200">
@@ -1685,45 +1642,15 @@ export const SimulationArena: React.FC = () => {
             </div>
 
             <div className="flex items-center gap-2">
-              {/* 全选所有按钮 */}
+              <span className="text-xs text-slate-500">对练仅负责产生对话，样本池管理与删除请前往飞轮工作台</span>
               <Button
-                size="middle"
-                onClick={() => {
-                  if (selectedRowKeys.length === historyBattles.length && historyBattles.length > 0) {
-                    setSelectedRowKeys([]);
-                  } else {
-                    setSelectedRowKeys(historyBattles.map((x) => x.sample_id));
-                  }
-                }}
+                type="primary"
+                ghost
+                icon={<ArrowRightOutlined />}
+                onClick={() => navigate(`/flywheel?rule_id=${selectedRuleId}`)}
               >
-                {selectedRowKeys.length === historyBattles.length && historyBattles.length > 0
-                  ? '取消全选'
-                  : `全选所有 (${historyBattles.length})`}
+                前往飞轮工作台管理样本池
               </Button>
-
-              <Popconfirm
-                title={`确认批量删除选中的 ${selectedRowKeys.length} 条会话记录？`}
-                disabled={selectedRowKeys.length === 0}
-                onConfirm={handleBatchDeleteSelected}
-              >
-                <Button
-                  danger
-                  icon={<DeleteOutlined />}
-                  disabled={selectedRowKeys.length === 0}
-                  loading={historyBatchDeleting}
-                >
-                  批量删除 ({selectedRowKeys.length})
-                </Button>
-              </Popconfirm>
-
-              <Popconfirm
-                title="确认清空当前规则下的所有历史对弈记录？"
-                onConfirm={handleClearAllHistory}
-              >
-                <Button danger ghost icon={<ClearOutlined />}>
-                  清空全部历史
-                </Button>
-              </Popconfirm>
             </div>
           </div>
 
@@ -1732,26 +1659,12 @@ export const SimulationArena: React.FC = () => {
             columns={historyColumns}
             dataSource={historyBattles}
             loading={historyLoading}
-            rowSelection={{
-              selectedRowKeys,
-              onChange: (keys) => setSelectedRowKeys(keys),
-              selections: [
-                Table.SELECTION_ALL,
-                Table.SELECTION_INVERT,
-                Table.SELECTION_NONE,
-                {
-                  key: 'select_all_data',
-                  text: `跨页全选所有 (${historyBattles.length} 条)`,
-                  onSelect: () => setSelectedRowKeys(historyBattles.map((x) => x.sample_id)),
-                },
-              ],
-            }}
             pagination={{
               current: historyPagination.current,
               pageSize: historyPagination.pageSize,
               showSizeChanger: true,
               pageSizeOptions: ['10', '20', '50', '100'],
-              showTotal: (total) => `共 ${total} 条历史对弈记录 (已选 ${selectedRowKeys.length} 条)`,
+              showTotal: (total) => `共 ${total} 条样本池历史对话记录（只读回看）`,
               onChange: (page, pageSize) => {
                 setHistoryPagination({ current: page, pageSize });
               },

@@ -1,0 +1,16 @@
+%% title: 样本池导出留底与留出普通题如实标记变更图
+flowchart LR
+  ui_fw["飞轮复核台\nfrontend/src/pages/FlywheelWorkbench.tsx\n留底标签与普通题预留开关"]:::changed
+  api_fw["飞轮API路由\nbackend/app/api/flywheel.py\n双出口留底与如实标记"]:::changed
+  api_ds["数据集路由\nbackend/app/api/datasets.py\n删或覆盖清理留底"]:::changed
+  api_deps["路由公共助手\nbackend/app/api/deps.py\n双向留底增删与对账"]:::changed
+  fw_svc["飞轮编排服务\nbackend/app/services/flywheel_service.py:FlywheelPipelineService\n联动改写评测集is_holdout"]:::changed
+  orm_fw[("飞轮样本表\nbackend/app/models/base.py:FlywheelSampleRecord\n训练与评测留底及存量迁移")]:::added
+  bench_files[("评测集文件\ndata/datasets\nis_holdout按留底如实改写")]:::changed
+
+  ui_fw -->|"导出训练集或评测题"| api_fw
+  api_fw -->|"校验留底并维护导出记录"| api_deps
+  api_fw -->|"切题写普通题或联动改写"| fw_svc
+  api_deps -->|"读写导出留底列表"| orm_fw
+  api_ds -->|"删或覆盖数据集清理留底"| api_deps
+  fw_svc -->|"先留出后进训改为普通题"| bench_files

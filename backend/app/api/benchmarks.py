@@ -466,7 +466,8 @@ def trigger_benchmark(
                 detail=(
                     "当前数据集为无答案标准的纯对话语料（全部样本均缺少 reference、rubric 与 regex_constraints），"
                     "常规评测会跳过所有校验导致假阳性 100% PASS。请改用「规则质检打分」"
-                    "（POST /api/v1/flywheel/inspect-dataset 或数据集中心 → 训练与对话语料 → 规则质检打分）；"
+                    "（POST /api/v1/flywheel/inspect-dataset，或前往数据集中心「训练与对话语料 (SFT)」/「淘汰对话隔离池」页签点击「规则质检打分」；"
+                    "若该文件此前误登记在评测集页签，请删除后按训练集重新导入）；"
                     "如仅需测试模型连通性或生成速度，请显式传入 allow_unlabeled=True。"
                 ),
             )

@@ -10,6 +10,7 @@
 4. 格式严格规范化校验 (validate_and_sanitize_format)。
 """
 import os
+import sys
 import json
 import time
 import threading
@@ -138,22 +139,434 @@ class FlywheelPipelineService:
 
         return True, ""
 
+    @classmethod
+    def _is_record_judge_error(cls, record: FlywheelRecord) -> bool:
+        """判断单条飞轮记录在初检或二次质检阶段是否发生裁判模型调用/解析异常。"""
+        if record.initial_eval is None or cls._is_judge_error_report(record.initial_eval):
+            return True
+        if record.verified_eval is not None and cls._is_judge_error_report(record.verified_eval):
+            return True
+        return False
+
+    @classmethod
+    def verdict_from_eval_dict(
+        cls,
+        eval_dict: Optional[Dict[str, Any]],
+        threshold: int = 85,
+        require_zero_defects: bool = False,
+    ) -> str:
+        """从质检报告字典推断解耦判定结论: UNJUDGED / PASS / FAIL / ERROR。"""
+        if not isinstance(eval_dict, dict) or ("score" not in eval_dict and "verdict" not in eval_dict):
+            return "UNJUDGED"
+        try:
+            rep = InspectionReport(**eval_dict)
+        except Exception:
+            ver = str(eval_dict.get("verdict") or "").upper()
+            sc = int(eval_dict.get("score") or 0) if eval_dict.get("score") is not None else 0
+            if ver == "PASS" and sc >= threshold:
+                if require_zero_defects and eval_dict.get("deductions"):
+                    return "FAIL"
+                return "PASS"
+            return "FAIL"
+
+        if cls._is_judge_error_report(rep):
+            return "ERROR"
+        if require_zero_defects:
+            return "PASS" if cls.is_gold_pass(rep, threshold) else "FAIL"
+        return "PASS" if (rep.verdict == "PASS" and rep.score >= threshold) else "FAIL"
+
     @staticmethod
+    def derive_sample_status(
+        raw_verdict: Optional[str],
+        remediated_verdict: Optional[str],
+        manual_decision: Optional[str],
+        active_version: Optional[str],
+    ) -> str:
+        """由解耦的原对话结论、修复后结论、人工复核结论与生效版本确定性派生顶层状态。"""
+        rv = (raw_verdict or "UNJUDGED").upper()
+        mv = (remediated_verdict or "NONE").upper()
+        md = (manual_decision or "NONE").upper()
+        av = (active_version or "raw").lower()
+
+        if md == "REJECTED":
+            return "DISCARDED"
+        if md == "APPROVED":
+            return "MANUAL_APPROVED"
+        if av == "remediated":
+            if mv == "PASS":
+                return "REPAIRED_PASS"
+            if mv == "FAIL" and rv == "FAIL":
+                return "DISCARDED"
+            return "PENDING"
+        # active_version == "raw"
+        if rv == "PASS":
+            return "GOLD_PASS"
+        if rv == "FAIL" and mv == "FAIL":
+            return "DISCARDED"
+        return "PENDING"
+
+    @classmethod
+    def infer_legacy_decoupled_state(
+        cls,
+        status: Optional[str],
+        initial_eval: Optional[Dict[str, Any]],
+        verified_eval: Optional[Dict[str, Any]],
+        has_remediated: bool,
+        threshold: int = 85,
+    ) -> Dict[str, str]:
+        """为旧式样本记录推断兼容的四元解耦状态字段。"""
+        st = (status or "PENDING").upper()
+        inferred_raw = cls.verdict_from_eval_dict(initial_eval, threshold, require_zero_defects=True)
+        inferred_ver = (
+            cls.verdict_from_eval_dict(verified_eval, threshold, require_zero_defects=False)
+            if isinstance(verified_eval, dict) and verified_eval
+            else ("UNVERIFIED" if has_remediated else "NONE")
+        )
+
+        if st == "GOLD_PASS":
+            return {
+                "raw_verdict": "PASS",
+                "remediated_verdict": "NONE",
+                "manual_decision": "NONE",
+                "active_version": "raw",
+            }
+        if st == "REPAIRED_PASS":
+            if not has_remediated:
+                return {
+                    "raw_verdict": "PASS",
+                    "remediated_verdict": "NONE",
+                    "manual_decision": "NONE",
+                    "active_version": "raw",
+                }
+            return {
+                "raw_verdict": inferred_raw if inferred_raw != "UNJUDGED" else "FAIL",
+                "remediated_verdict": "PASS",
+                "manual_decision": "NONE",
+                "active_version": "remediated",
+            }
+        if st == "MANUAL_APPROVED":
+            return {
+                "raw_verdict": inferred_raw,
+                "remediated_verdict": inferred_ver if has_remediated else "NONE",
+                "manual_decision": "APPROVED",
+                "active_version": "remediated" if has_remediated else "raw",
+            }
+        if st == "DISCARDED":
+            rv = inferred_raw if inferred_raw != "UNJUDGED" else "FAIL"
+            if has_remed := bool(has_remediated):
+                mv = inferred_ver if inferred_ver != "UNVERIFIED" else "FAIL"
+                md = "REJECTED" if mv != "FAIL" else "NONE"
+                av = "remediated" if has_remed else "raw"
+            else:
+                mv = "NONE"
+                md = "REJECTED"
+                av = "raw"
+            return {
+                "raw_verdict": rv,
+                "remediated_verdict": mv,
+                "manual_decision": md,
+                "active_version": av,
+            }
+        return {
+            "raw_verdict": inferred_raw,
+            "remediated_verdict": inferred_ver if has_remediated else "NONE",
+            "manual_decision": "NONE",
+            "active_version": "remediated" if has_remediated else "raw",
+        }
+
+    @classmethod
+    def compute_record_decoupled_state(
+        cls,
+        record: FlywheelRecord,
+        threshold: int = 85,
+    ) -> Dict[str, str]:
+        """根据单条飞轮处理产物 FlywheelRecord 计算入库四元解耦状态及派生 status。"""
+        init_dict = record.initial_eval.model_dump() if record.initial_eval else None
+        ver_dict = record.verified_eval.model_dump() if record.verified_eval else None
+        has_remed = bool(record.remediated_messages)
+
+        if record.status == "GOLD_PASS":
+            raw_v = "PASS"
+            remed_v = "NONE"
+            manual_d = "NONE"
+            active_v = "raw"
+        else:
+            raw_v = cls.verdict_from_eval_dict(init_dict, threshold, require_zero_defects=True)
+            if has_remed:
+                remed_v = (
+                    cls.verdict_from_eval_dict(ver_dict, threshold, require_zero_defects=False)
+                    if ver_dict
+                    else "UNVERIFIED"
+                )
+                active_v = "remediated"
+            else:
+                remed_v = "NONE"
+                active_v = "raw"
+            manual_d = "REJECTED" if record.status == "DISCARDED" and not (raw_v == "FAIL" and remed_v == "FAIL") else "NONE"
+
+        return {
+            "raw_verdict": raw_v,
+            "remediated_verdict": remed_v,
+            "manual_decision": manual_d,
+            "active_version": active_v,
+            "status": cls.derive_sample_status(raw_v, remed_v, manual_d, active_v),
+        }
+
+    @classmethod
+    def apply_rejudge_transition(
+        cls,
+        eval_report: InspectionReport,
+        threshold: int,
+        target_data: str = "raw",
+        raw_verdict: str = "UNJUDGED",
+        remediated_verdict: str = "NONE",
+        manual_decision: str = "NONE",
+        active_version: str = "raw",
+        has_remediated_messages: bool = False,
+        rule_changed: bool = False,
+    ) -> Dict[str, str]:
+        """
+        根据重检目标 (raw / remediated)、新裁判报告与规则是否变更，计算解耦四元组与派生顶层 status:
+        - 重检 raw 直接达标: raw_verdict="PASS", active_version="raw"；
+        - 重检 raw 未直接达标但规则切换/更新: 旧 remediated PASS 降为 UNVERIFIED(保留文本), 旧 MANUAL_APPROVED 降为 NONE(保留备注)；
+        - 重检 raw 在同一未变更规则下: 不冲掉已验收的 REPAIRED_PASS 或已人工放行的 MANUAL_APPROVED；
+        - 重检 remediated: 仅刷新 remediated_verdict 并视结果切换 active_version。
+        """
+        new_raw = (raw_verdict or "UNJUDGED").upper()
+        new_remed = (remediated_verdict or "NONE").upper()
+        new_manual = (manual_decision or "NONE").upper()
+        new_active = (active_version or "raw").lower()
+
+        if target_data == "remediated":
+            if cls._is_judge_error_report(eval_report):
+                new_remed = "ERROR"
+            elif eval_report.score >= threshold and eval_report.verdict == "PASS":
+                new_remed = "PASS"
+            else:
+                new_remed = "FAIL"
+            if has_remediated_messages:
+                new_active = "remediated"
+            if rule_changed and new_manual == "APPROVED":
+                new_manual = "NONE"
+            if new_remed == "PASS" and new_manual == "REJECTED":
+                new_manual = "NONE"
+        else:
+            if cls._is_judge_error_report(eval_report):
+                new_raw = "ERROR"
+            elif cls.is_gold_pass(eval_report, threshold):
+                new_raw = "PASS"
+            else:
+                new_raw = "FAIL"
+
+            if new_raw == "PASS":
+                new_active = "raw"
+                if new_manual == "REJECTED":
+                    new_manual = "NONE"
+                if rule_changed:
+                    if has_remediated_messages and new_remed in ("PASS", "FAIL"):
+                        new_remed = "UNVERIFIED"
+                    if new_manual == "APPROVED":
+                        new_manual = "NONE"
+            else:
+                if rule_changed:
+                    if has_remediated_messages and new_remed == "PASS":
+                        new_remed = "UNVERIFIED"
+                    if new_manual == "APPROVED":
+                        new_manual = "NONE"
+
+        return {
+            "raw_verdict": new_raw,
+            "remediated_verdict": new_remed,
+            "manual_decision": new_manual,
+            "active_version": new_active,
+            "status": cls.derive_sample_status(new_raw, new_remed, new_manual, new_active),
+        }
+
+    @classmethod
     def resolve_rejudge_status(
+        cls,
         eval_report: InspectionReport,
         threshold: int,
         target_data: str = "raw",
         current_status: str = "PENDING",
     ) -> str:
-        """根据重检目标 (raw / remediated) 与评估报告判定治理后的样本状态。"""
+        """兼容包装：根据重检目标与评估报告判定治理后的样本状态。"""
         if target_data == "remediated":
+            if cls._is_judge_error_report(eval_report):
+                return "PENDING"
             is_pass = bool(
                 eval_report.score >= threshold and eval_report.verdict == "PASS"
             )
             return "REPAIRED_PASS" if is_pass else "DISCARDED"
-        if FlywheelPipelineService.is_gold_pass(eval_report, threshold):
+        if cls._is_judge_error_report(eval_report):
+            return current_status if current_status in ("DISCARDED", "MANUAL_APPROVED") else "PENDING"
+        if cls.is_gold_pass(eval_report, threshold):
             return "GOLD_PASS"
         return "DISCARDED" if current_status == "DISCARDED" else "PENDING"
+
+    @staticmethod
+    def validate_manual_dialogue_messages(
+        messages: List[Any],
+        default_system_prompt: str = "你是专业的业务对话机器人。",
+    ) -> Tuple[bool, str]:
+        """校验人工放行或保存时选定版本的对话消息非空且符合 SFT 角色要求。"""
+        if not messages or not isinstance(messages, list):
+            return False, "选定生效版本的对话消息为空，无法人工放行"
+        chat_objs: List[ChatMessage] = []
+        has_asst = False
+        for m in messages:
+            if isinstance(m, ChatMessage):
+                role = m.role
+                content = m.content
+                thinking = m.thinking
+            elif isinstance(m, dict):
+                role = str(m.get("role") or "").strip().lower()
+                content = str(m.get("content") or "")
+                thinking = m.get("thinking")
+            else:
+                continue
+            if role not in ("system", "user", "assistant"):
+                return False, f"存在非法消息角色 '{role}'，仅允许 system / user / assistant"
+            if role == "assistant" and content.replace("[挂断电话]", "").strip():
+                has_asst = True
+            if content.replace("[挂断电话]", "").strip() or role == "system":
+                chat_objs.append(
+                    ChatMessage(role=role, content=content, thinking=thinking)  # type: ignore[arg-type]
+                )
+        if not has_asst:
+            return False, "选定生效版本缺少有效的 assistant 回复，无法人工放行"
+
+        # 若最后一条在 user 之前没有任何 user->assistant 对且是外呼开场，不强制剔除末尾 user
+        roles_non_sys = [c.role for c in chat_objs if c.role != "system"]
+        req_asst_end = "user" in roles_non_sys and any(
+            roles_non_sys[i] == "user" and any(r == "assistant" for r in roles_non_sys[i:])
+            for i in range(len(roles_non_sys))
+        )
+        ok, _, reason = UniversalDataRemediator.validate_and_sanitize_format(
+            chat_objs,
+            default_system_prompt=default_system_prompt,
+            inject_empty_thinking=False,
+            require_assistant_ending=req_asst_end,
+        )
+        return ok, reason
+
+    @staticmethod
+    def prepare_dialogue_for_training_export(
+        raw_messages: List[Any],
+        remediated_messages: Optional[List[Any]],
+        active_version: Optional[str],
+        default_system_prompt: str,
+        inject_thinking: bool = False,
+    ) -> Tuple[bool, List[Dict[str, Any]], str]:
+        """
+        严格按 active_version 提取并清洗待导出训练集的对话消息:
+        - active_version == 'remediated': 必须使用 remediated_messages，禁止回退 raw_messages;
+        - active_version == 'raw': 必须使用 raw_messages，禁止混用未验收的 remediated_messages。
+        """
+        ver = (active_version or "raw").lower()
+        if ver == "remediated":
+            src_list = remediated_messages or []
+            if not src_list:
+                return False, [], "当前生效版本为修复后对话 (remediated)，但修复内容为空，无法导出"
+        else:
+            src_list = raw_messages or []
+            if not src_list:
+                return False, [], "原对话消息为空，无法导出"
+
+        chat_objs: List[ChatMessage] = []
+        for m in src_list:
+            if isinstance(m, ChatMessage):
+                chat_objs.append(m)
+            elif isinstance(m, dict):
+                role = str(m.get("role") or "").strip().lower()
+                if role not in ("system", "user", "assistant"):
+                    continue
+                chat_objs.append(
+                    ChatMessage(
+                        role=role,  # type: ignore[arg-type]
+                        content=str(m.get("content") or ""),
+                        thinking=m.get("thinking"),
+                    )
+                )
+
+        roles_non_sys = [c.role for c in chat_objs if c.role != "system"]
+        req_asst_end = any(
+            roles_non_sys[i] == "user" and any(r == "assistant" for r in roles_non_sys[i:])
+            for i in range(len(roles_non_sys))
+        )
+        ok, sanitized, reason = UniversalDataRemediator.validate_and_sanitize_format(
+            chat_objs,
+            default_system_prompt=default_system_prompt,
+            inject_empty_thinking=inject_thinking,
+            require_assistant_ending=req_asst_end,
+        )
+        if not ok:
+            return False, [], reason
+
+        out_dicts: List[Dict[str, Any]] = []
+        for m in sanitized:
+            entry: Dict[str, Any] = {"role": m.role, "content": m.content}
+            if inject_thinking and m.role == "assistant":
+                entry["thinking"] = m.thinking or ""
+            out_dicts.append(entry)
+        return True, out_dicts, ""
+
+    @staticmethod
+    def rewrite_benchmark_holdout_for_samples(
+        dataset_file_paths: List[str],
+        sample_ids: Set[str],
+    ) -> int:
+        """
+        将指定评测集 JSONL 文件中来源于 sample_ids 的留出题 (is_holdout=True) 原子改写为普通题 (is_holdout=False)。
+        不触碰战绩流水表，保持连胜战绩完整。
+        """
+        if not dataset_file_paths or not sample_ids:
+            return 0
+        rewritten = 0
+        prefixed = {f"flywheel_{sid}" for sid in sample_ids}
+        seen_paths: Set[str] = set()
+        for fpath in dataset_file_paths:
+            if not fpath or fpath in seen_paths or not os.path.exists(fpath):
+                continue
+            seen_paths.add(fpath)
+            changed = False
+            new_lines: List[str] = []
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw_s = line.strip()
+                    if not raw_s:
+                        continue
+                    try:
+                        obj = json.loads(raw_s)
+                    except Exception:
+                        new_lines.append(raw_s)
+                        continue
+                    if isinstance(obj, dict):
+                        meta = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+                        src_sid = str(meta.get("source_sample_id") or "").strip()
+                        src_tag = str(obj.get("source") or "").strip()
+                        if (src_sid in sample_ids or src_tag in prefixed) and obj.get("is_holdout") is True:
+                            obj["is_holdout"] = False
+                            changed = True
+                            rewritten += 1
+                        new_lines.append(json.dumps(obj, ensure_ascii=False))
+                    else:
+                        new_lines.append(raw_s)
+            if changed:
+                tmp_path = f"{fpath}.tmp.{os.getpid()}.{threading.get_ident()}"
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as wf:
+                        for ln in new_lines:
+                            wf.write(ln + "\n")
+                    os.replace(tmp_path, fpath)
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                    raise
+        return rewritten
 
     def judge_dialogue(
         self,
@@ -505,7 +918,9 @@ class FlywheelPipelineService:
             if second_eval.notices:
                 notices.extend(second_eval.notices)
 
-            if second_eval.score >= threshold and second_eval.verdict == "PASS":
+            if self._is_judge_error_report(second_eval):
+                record.status = "PENDING"
+            elif second_eval.score >= threshold and second_eval.verdict == "PASS":
                 record.status = "REPAIRED_PASS"
             else:
                 record.status = "DISCARDED"
@@ -565,17 +980,20 @@ class FlywheelPipelineService:
         processed_ids = self._get_processed_ids([gold_output_path, discard_output_path])
 
         todo_items: List[Tuple[str, PersonaDefinition, List[ChatMessage]]] = []
+        skipped_count = 0
         for idx, item in enumerate(input_records):
             sid, _, matched_sc, chat_msgs = self._parse_dialogue_record_item(rule, item, idx)
             if sid in processed_ids:
+                skipped_count += 1
                 continue
             todo_items.append((sid, matched_sc, chat_msgs))
 
         stats: Dict[str, Any] = {
             "total": len(input_records),
-            "skipped": len(processed_ids),
+            "skipped": skipped_count,
             "gold": 0,
             "discarded": 0,
+            "judge_error": 0,
             "excluded_holdout": 0,
             "failed_persist": 0,
             "final_gold_count": len(preexisting_gold_rows),
@@ -598,7 +1016,16 @@ class FlywheelPipelineService:
                 try:
                     rec, orig_msgs = future.result()
                 except Exception as e:
-                    print(f"⚠️ [FlywheelPipeline] 样本 {sid} 治理推理异常: {e}")
+                    print(f"⚠️ [FlywheelPipeline] 样本 {sid} 治理推理异常: {e}", file=sys.stderr)
+                    stats["judge_error"] += 1
+                    continue
+
+                if self._is_record_judge_error(rec):
+                    print(
+                        f"⚠️ [FlywheelPipeline] 样本 {sid} 质检裁判异常，已跳过落盘以便续跑重试",
+                        file=sys.stderr,
+                    )
+                    stats["judge_error"] += 1
                     continue
 
                 is_holdout_source: bool = False
@@ -606,7 +1033,10 @@ class FlywheelPipelineService:
                     try:
                         is_holdout_source = bool(on_record_done(rec, orig_msgs))
                     except Exception as cb_err:
-                        print(f"⚠️ [FlywheelPipeline] 样本 {sid} 持久化/留出核查异常，已阻断写入黄金集: {cb_err}")
+                        print(
+                            f"⚠️ [FlywheelPipeline] 样本 {sid} 持久化/留出核查异常，已阻断写入黄金集: {cb_err}",
+                            file=sys.stderr,
+                        )
                         stats["failed_persist"] += 1
                         continue
 
@@ -625,7 +1055,7 @@ class FlywheelPipelineService:
                         self._append_row_unlocked(gold_output_path, self._strip_internal_meta(gold_row))
                     stats["gold"] += 1
                 else:
-                    self._flush_record(rec, gold_output_path, discard_output_path)
+                    self._flush_discarded_record(rec, discard_output_path)
                     stats["discarded"] += 1
 
         if new_gold_rows:
@@ -680,10 +1110,15 @@ class FlywheelPipelineService:
         return processed
 
     def _build_output_row(self, record: FlywheelRecord) -> Dict[str, Any]:
-        target_msgs: List[ChatMessage] = record.remediated_messages or record.raw_messages
+        is_remed = bool(record.remediated_messages and record.status != "GOLD_PASS")
+        target_msgs: List[ChatMessage] = (
+            record.remediated_messages if (is_remed and record.remediated_messages) else record.raw_messages
+        )
         return {
             "id": record.id,
             "metadata": {
+                "source_sample_id": record.id,
+                "active_version": "remediated" if is_remed else "raw",
                 "rule_id": record.rule_id,
                 "scenario_id": record.scenario_id,
                 "status": record.status,
@@ -710,6 +1145,15 @@ class FlywheelPipelineService:
         with open(target_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(out_obj, ensure_ascii=False) + "\n")
             f.flush()
+
+    def _flush_discarded_record(self, record: FlywheelRecord, discard_path: str) -> None:
+        out_obj = self._build_output_row(record)
+        meta = out_obj.setdefault("metadata", {})
+        meta["status"] = "DISCARDED"
+        if record.skip_reason:
+            meta["skip_reason"] = record.skip_reason
+        with self._lock:
+            self._append_row_unlocked(discard_path, out_obj)
 
     def _flush_record(self, record: FlywheelRecord, gold_path: str, discard_path: str) -> None:
         target_path = gold_path if record.status in ("GOLD_PASS", "REPAIRED_PASS") else discard_path

@@ -1126,6 +1126,8 @@ export const BenchmarkList: React.FC = () => {
                   label:
                     d.dataset_type === 'benchmark'
                       ? `${d.name} (${d.sample_count}条 · 基准考题集)`
+                      : d.dataset_type === 'flywheel_discarded'
+                      ? `${d.name} (${d.sample_count}条 · ⚠️ 淘汰对话，建议改走规则质检)`
                       : `${d.name} (${d.sample_count}条 · ⚠️ ${d.dataset_type} 纯对话语料，建议改走规则质检)`,
                 })),
                 {
@@ -1145,7 +1147,11 @@ export const BenchmarkList: React.FC = () => {
               type="warning"
               showIcon
               className="mb-2"
-              message="当前选择的是「纯对话训练语料」，而非包含答案标准/正则的基准考题集"
+              message={
+                selectedDatasetRecord?.dataset_type === 'flywheel_discarded'
+                  ? '当前选择的是「淘汰对话隔离语料」，而非包含答案标准/正则的基准考题集'
+                  : '当前选择的是「纯对话训练语料」，而非包含答案标准/正则的基准考题集'
+              }
               description={
                 <div className="space-y-2 text-xs">
                   <div>

@@ -928,7 +928,7 @@ def test_cli_end_to_end_all_groups(
     )
     assert rc == 0 and bdel_res["deleted_count"] == 1
 
-    # ---- G. simulation (run / stream / stream --ndjson / recent / evaluate / clear-all) ----
+    # ---- G. simulation (run / stream / stream --ndjson / recent / evaluate) ----
     rc, sim_res, _ = _run_main(
         [
             "--in-process",
@@ -1344,15 +1344,14 @@ def test_cli_end_to_end_all_groups(
     )
     assert rc == 0 and fb_res["id"].startswith("fly_") and fb_res["status"] == "COMPLETED"
 
-    # delete / batch-delete / simulation clear-all
+    # delete / batch-delete (clear-all 已下线，仅在飞轮样本池删除)
     rc, fdel, _ = _run_main(["--in-process", "flywheel", "delete", fw_sample_id], capsys)
     assert rc == 0
 
     rc, fbdel, _ = _run_main(["--in-process", "flywheel", "batch-delete", "--sample-id", sim_sample_id], capsys)
     assert rc == 0
 
-    rc, sim_clr, _ = _run_main(["--in-process", "simulation", "clear-all", "--rule-id", "cli_smoke_rule"], capsys)
-    assert rc == 0 and "deleted_count" in sim_clr
+    assert "clear-all" not in build_cli().commands["simulation"].commands
 
     # 清理数据集与模型
     for did in ("cli_bench_ds", "cli_fw_bench_1", "cli_fw_bench_batch"):

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-全量命令目录契约 (59 条后端 API + 2 条本地能力治理命令 = 61 条)
+全量命令目录契约 (58 条后端 API + 2 条本地能力治理命令 = 60 条)
 """
 from __future__ import annotations
 
@@ -75,12 +75,11 @@ COMMAND_CATALOG: Tuple[CommandSpec, ...] = (
     CommandSpec("benchmark.debug-judge", "benchmark", "debug-judge", "read", "POST", "/api/v1/benchmarks/debug-judge-prompt", "组装常规评测裁判调试 Prompt", supports_payload=True),
     CommandSpec("benchmark.test-judge", "benchmark", "test-judge", "run", "POST", "/api/v1/benchmarks/test-judge-prompt", "在线实测常规评测裁判 Prompt", supports_payload=True),
 
-    # --- simulation (5) ---
+    # --- simulation (4) ---
     CommandSpec("simulation.run", "simulation", "run", "run", "POST", "/api/v1/simulation/simulate", "同步执行双 Agent 模拟对弈与质检修复", supports_payload=True),
     CommandSpec("simulation.stream", "simulation", "stream", "run", "POST", "/api/v1/simulation/simulate/stream", "流式消费 SSE 双 Agent 模拟对弈", supports_payload=True, is_streaming=True),
     CommandSpec("simulation.recent", "simulation", "recent", "read", "GET", "/api/v1/simulation/battles/recent", "查询近期模拟对弈历史记录"),
     CommandSpec("simulation.evaluate", "simulation", "evaluate", "run", "POST", "/api/v1/simulation/evaluate-dialogue", "对一段人工对话执行白盒质检与可选入库", supports_payload=True),
-    CommandSpec("simulation.clear-all", "simulation", "clear-all", "destructive", "DELETE", "/api/v1/simulation/battles/all", "清空全部或指定规则下的历史对弈样本"),
 
     # --- flywheel (18) ---
     CommandSpec("flywheel.samples", "flywheel", "samples", "read", "GET", "/api/v1/flywheel/samples", "查询飞轮样本与质检修复状态"),

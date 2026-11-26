@@ -445,7 +445,7 @@ def test_full_regression(tmp_path: pathlib.Path, monkeypatch):
             assert s["status"] == "MANUAL_APPROVED"
             assert s["reviewer_comment"] == "批量人工审核放行"
 
-    # b. 测试批量定点补考
+    # b. 测试批量定点补考（默认不开启二次验收，修复后落为 PENDING，待人工或二检确认）
     r_batch_remed = client.post("/api/v1/flywheel/samples/batch-remediate", json={
         "sample_ids": [sample_id_1, sample_id_2],
         "judge_model_id": test_model_id,
@@ -455,7 +455,22 @@ def test_full_regression(tmp_path: pathlib.Path, monkeypatch):
     assert r_batch_remed.json()["total"] == 2
     assert r_batch_remed.json()["succeeded"] == 2
 
-    # c. 测试批量导出选定样本
+    # c. 验证 PENDING 状态不可直接导出训练集，需经人工复核放行后导出选定样本
+    r_batch_exp_blocked = client.post("/api/v1/flywheel/samples/export-selected", json={
+        "sample_ids": [sample_id_1, sample_id_2],
+        "version_tag": "test_batch_blocked",
+        "inject_thinking": False
+    })
+    assert r_batch_exp_blocked.status_code == 400, f"PENDING 样本不应直接导出: {r_batch_exp_blocked.text}"
+
+    r_reapprove = client.post("/api/v1/flywheel/samples/batch-status", json={
+        "sample_ids": [sample_id_1, sample_id_2],
+        "status": "MANUAL_APPROVED",
+        "active_version": "remediated",
+        "reviewer_comment": "复核补考修复结果通过"
+    })
+    assert r_reapprove.status_code == 200, f"人工复核放行失败: {r_reapprove.text}"
+
     r_batch_exp = client.post("/api/v1/flywheel/samples/export-selected", json={
         "sample_ids": [sample_id_1, sample_id_2],
         "version_tag": "test_batch",

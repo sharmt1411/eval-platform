@@ -66,6 +66,10 @@ def _brief_flywheel_sample(item: Dict[str, Any]) -> Dict[str, Any]:
         "rule_id": item.get("rule_id"),
         "scenario_id": item.get("scenario_id"),
         "status": item.get("status"),
+        "raw_verdict": item.get("raw_verdict"),
+        "remediated_verdict": item.get("remediated_verdict"),
+        "manual_decision": item.get("manual_decision"),
+        "active_version": item.get("active_version"),
         "score": item.get("score"),
         "raw_turns": len(raw_msgs) if isinstance(raw_msgs, list) else 0,
         "remediated_turns": len(remed_msgs) if isinstance(remed_msgs, list) else None,
@@ -73,6 +77,8 @@ def _brief_flywheel_sample(item: Dict[str, Any]) -> Dict[str, Any]:
         "initial_defects": init_eval.get("detected_defects") if isinstance(init_eval, dict) else None,
         "verified_verdict": ver_eval.get("verdict") if isinstance(ver_eval, dict) else None,
         "exported_to_benchmark": item.get("exported_to_benchmark"),
+        "exported_training_datasets": item.get("exported_training_datasets") or [],
+        "exported_benchmark_datasets": item.get("exported_benchmark_datasets") or [],
         "reviewer_comment": item.get("reviewer_comment"),
         "updated_at": item.get("updated_at"),
     }
@@ -341,6 +347,7 @@ def batch_remediate_cmd(
 @click.command("update")
 @click.argument("sample_id")
 @click.option("--status", default=None, type=FLYWHEEL_STATUS_CHOICES, help="复核状态 (GOLD_PASS/REPAIRED_PASS/DISCARDED/MANUAL_APPROVED/PENDING)")
+@click.option("--active-version", default=None, type=click.Choice(["raw", "remediated"], case_sensitive=False), help="指定生效对话版本 (raw/remediated)")
 @click.option("--reviewer-comment", default=None, help="人工评审备注")
 @click.option("--messages-file", default=None, help="人工修订后的 remediated_messages JSON 文件")
 @click.option("--payload", "payload_file", default=None, help="完整 SampleReviewUpdateRequest JSON 文件")
@@ -350,15 +357,17 @@ def update_sample_cmd(
     ctx: click.Context,
     sample_id: str,
     status: Optional[str],
+    active_version: Optional[str],
     reviewer_comment: Optional[str],
     messages_file: Optional[str],
     payload_file: Optional[str],
     payload_json: Optional[str],
 ) -> None:
-    """人工复核更新单条样本状态、语料或备注"""
+    """人工复核更新单条样本状态、生效版本、语料或备注"""
     check_command_allowed(ctx, "flywheel.update")
     overrides: Dict[str, Any] = {
         "status": status.upper() if status else None,
+        "active_version": active_version.lower() if active_version else None,
         "reviewer_comment": reviewer_comment,
     }
     if messages_file:
@@ -376,6 +385,7 @@ def update_sample_cmd(
 @click.command("batch-status")
 @click.option("--sample-id", "sample_ids", multiple=True, help="样本 ID（可多次传入或逗号分隔）")
 @click.option("--status", default=None, type=FLYWHEEL_STATUS_CHOICES, help="目标状态")
+@click.option("--active-version", default=None, type=click.Choice(["raw", "remediated"], case_sensitive=False), help="统一指定生效对话版本 (raw/remediated)")
 @click.option("--reviewer-comment", default=None, help="批量评审备注")
 @click.option("--payload", "payload_file", default=None, help="完整 BatchUpdateStatusRequest JSON 文件")
 @click.option("--payload-json", default=None, help="完整 BatchUpdateStatusRequest JSON 字符串")
@@ -384,6 +394,7 @@ def batch_status_cmd(
     ctx: click.Context,
     sample_ids: Tuple[str, ...],
     status: Optional[str],
+    active_version: Optional[str],
     reviewer_comment: Optional[str],
     payload_file: Optional[str],
     payload_json: Optional[str],
@@ -392,6 +403,7 @@ def batch_status_cmd(
     check_command_allowed(ctx, "flywheel.batch-status")
     overrides: Dict[str, Any] = {
         "status": status.upper() if status else None,
+        "active_version": active_version.lower() if active_version else None,
         "reviewer_comment": reviewer_comment,
     }
     if sample_ids:
@@ -601,6 +613,7 @@ def export_selected_cmd(
 @click.option("--name", default=None, help="目标评测集名称")
 @click.option("--slice-id", "slice_ids", multiple=True, help="仅导出指定 slice_id（不传则导出全部切片）")
 @click.option("--mode", default=None, type=click.Choice(["create", "append"], case_sensitive=False), help="新建覆盖或追加")
+@click.option("--reserve-for-training/--no-reserve-for-training", default=None, help="预留后续进训练集：主动标为普通题 (is_holdout=false)")
 @click.option("--enable-dedup/--no-dedup", default=None, help="是否启用去重与防稀释")
 @click.option("--cluster-quota", type=int, default=None, help="单簇保留上限 K")
 @click.option("--sim-threshold", type=float, default=None, help="同答拆簇余弦相似度阈值 θ")
@@ -615,6 +628,7 @@ def export_benchmark_cmd(
     name: Optional[str],
     slice_ids: Tuple[str, ...],
     mode: Optional[str],
+    reserve_for_training: Optional[bool],
     enable_dedup: Optional[bool],
     cluster_quota: Optional[int],
     sim_threshold: Optional[float],
@@ -622,9 +636,14 @@ def export_benchmark_cmd(
     payload_file: Optional[str],
     payload_json: Optional[str],
 ) -> None:
-    """将单条样本切片导出并注册为纯评测留出数据集"""
+    """将单条样本切片导出并注册为评测集（按训练集留底如实标留出题或普通题）"""
     check_command_allowed(ctx, "flywheel.export-benchmark")
-    overrides: Dict[str, Any] = {"dataset_id": dataset_id, "name": name, "mode": mode}
+    overrides: Dict[str, Any] = {
+        "dataset_id": dataset_id,
+        "name": name,
+        "mode": mode,
+        "reserve_for_training": reserve_for_training,
+    }
     if slice_ids:
         overrides["slice_ids"] = parse_str_list(slice_ids)
     body = load_payload(payload_file, payload_json, overrides)
@@ -652,6 +671,7 @@ def export_benchmark_cmd(
 @click.option("--name", default=None, help="目标评测集名称")
 @click.option("--mode", default=None, type=click.Choice(["create", "append"], case_sensitive=False))
 @click.option("--strategy", default=None, type=click.Choice(["all_defects", "primary_defect_only"], case_sensitive=False))
+@click.option("--reserve-for-training/--no-reserve-for-training", default=None, help="预留后续进训练集：主动标为普通题 (is_holdout=false)")
 @click.option("--enable-dedup/--no-dedup", default=None, help="是否启用去重与防稀释")
 @click.option("--cluster-quota", type=int, default=None, help="单簇保留上限 K")
 @click.option("--sim-threshold", type=float, default=None, help="同答拆簇余弦相似度阈值 θ")
@@ -666,6 +686,7 @@ def batch_export_benchmark_cmd(
     name: Optional[str],
     mode: Optional[str],
     strategy: Optional[str],
+    reserve_for_training: Optional[bool],
     enable_dedup: Optional[bool],
     cluster_quota: Optional[int],
     sim_threshold: Optional[float],
@@ -680,6 +701,7 @@ def batch_export_benchmark_cmd(
         "name": name,
         "mode": mode,
         "strategy": strategy,
+        "reserve_for_training": reserve_for_training,
     }
     if sample_ids:
         overrides["sample_ids"] = parse_str_list(sample_ids)

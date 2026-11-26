@@ -1,0 +1,20 @@
+%% title: 数据流第一组五项修复变更图
+flowchart LR
+  ui_ds["数据集中心\nfrontend/src/pages/DatasetCenter.tsx\n增淘汰池页签禁用写快照"]:::changed
+  ui_sim["模拟对弈台\nfrontend/src/pages/SimulationArena.tsx\n历史列表改为只读回看"]:::changed
+  api_ds["数据集路由\nbackend/app/api/datasets.py\n按内容分类并校验答案"]:::changed
+  api_bench["常规评测路由\nbackend/app/api/benchmarks.py\n对齐拦截提示到实际页签"]:::changed
+  api_sim["模拟对弈路由\nbackend/app/api/simulation.py\n下线clear_all接口"]:::changed
+  cli_sim["CLI对弈命令\ncli/commands/simulation.py\n下线clear-all命令"]:::changed
+  api_fw["飞轮API路由\nbackend/app/api/flywheel.py\n批量治理登记淘汰文件"]:::changed
+  fw_svc["飞轮编排服务\nbackend/app/services/flywheel_service.py:FlywheelPipelineService\n隔离质检出错防进淘汰"]:::changed
+  sampler["抽样与账本引擎\nbackend/app/engine/benchmark_sampler.py:BenchmarkSamplingEngine\n忽略文件内eval_tracker"]:::changed
+  runner["评测标准校验\nbackend/app/engine/benchmark_runner.py:has_sample_eval_criteria"]
+
+  ui_ds -->|"三分类与过滤导出"| api_ds
+  ui_sim -.->|"只读历史回看"| api_sim
+  cli_sim -.->|"下线clear-all"| api_sim
+  api_ds -->|"逐条答案校验"| runner
+  api_bench -->|"兜底校验拦截"| runner
+  api_fw -->|"批量治理入库登记"| fw_svc
+  api_ds -->|"试算与过滤抽样"| sampler

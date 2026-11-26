@@ -67,7 +67,7 @@
 ### 6. 工程细节与双入口
 - **保留 Prefix Cache**：模拟对弈中每轮变化的客户情绪、耐受度等动态提示附在最新一轮 `user` 消息末尾，使静态 `system` 前缀保持不变，减少长对话调用时的缓存失效开销。
 - **全配置化与在线调试**：场景流程图、红线、FAQ、客户人设以及引擎内置的 8 套提示词模板均可在界面编辑，规则中心支持拼装真实上下文并在线调用已注册模型做单步实测（支持导出报文）。
-- **Agent CLI (`evalctl`)**：除 Web 工作台外，提供覆盖 8 大命令组、61 条子命令的 `evalctl` CLI，支持紧凑表格输出、大载荷落盘（防撑爆上下文）、`--in-process` 免启服务端直调，以及 5 套可裁剪命令的权限 Profile（如 `readonly`、`eval-loop`、`flywheel-loop` 等）。
+- **Agent CLI (`evalctl`)**：除 Web 工作台外，提供覆盖 8 大命令组、60 条子命令的 `evalctl` CLI，支持紧凑表格输出、大载荷落盘（防撑爆上下文）、`--in-process` 免启服务端直调，以及 5 套可裁剪命令的权限 Profile（如 `readonly`、`eval-loop`、`flywheel-loop` 等）。
 
 ---
 
@@ -142,7 +142,7 @@ flowchart LR
 ```text
 eval-platform/
 ├── backend/                # FastAPI 服务、模型适配器、评测/对弈/质检/修复/切题/抽样引擎与 pytest 测试
-├── cli/                    # evalctl 命令行工具、61 条子命令与权限策略 Profile 配置
+├── cli/                    # evalctl 命令行工具、60 条子命令与权限策略 Profile 配置
 ├── frontend/               # React + TypeScript + Vite + Ant Design + Mermaid + ECharts + Monaco 工作台
 ├── docs/                   # 设计方案文档、系统地图 (docs/map/) 与脱敏界面截图 (docs/images/)
 ├── data/                   # 本地数据资产目录（规则、数据集、运行产物、SQLite 数据库，默认已 Git 忽略）

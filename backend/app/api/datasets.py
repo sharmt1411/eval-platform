@@ -13,6 +13,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from backend.app.config import settings
 from backend.app.models import get_db, DatasetRecord
+from backend.app.api.deps import (
+    sync_lineage_on_dataset_overwritten,
+    sync_lineage_on_dataset_removed,
+)
 from backend.app.schemas.benchmark import (
     BenchmarkSample,
     BenchmarkExportFilterRequest,
@@ -22,6 +26,7 @@ from backend.app.schemas.benchmark import (
 )
 from backend.app.schemas.flywheel import DedupConfig
 from backend.app.engine.benchmark_sampler import BenchmarkSamplingEngine
+from backend.app.engine.benchmark_runner import has_sample_eval_criteria
 from backend.app.engine.deduplicator import DatasetDeduplicator
 
 router = APIRouter(prefix="/datasets", tags=["数据集管理"])
@@ -173,6 +178,48 @@ def _parse_raw_samples(
     return raw_list
 
 
+def _infer_dataset_type_from_file(fpath: str) -> Literal["benchmark", "flywheel_gold", "flywheel_discarded"]:
+    """完全基于文件内容判定数据资产类别（不依赖文件名）：
+    1. 每行都可解析为合法评测题且具备 reference / rubric / regex_constraints 之一 -> benchmark；
+    2. 非 benchmark 的飞轮输出文件中，全部记录为 DISCARDED / PENDING（且含 DISCARDED 或质检淘汰特征字段，无任何达标记录） -> flywheel_discarded；
+    3. 其余对话文件 -> flywheel_gold。
+    """
+    rows = _load_existing_jsonl_rows(fpath)
+    if not rows:
+        return "flywheel_gold"
+
+    all_benchmark = True
+    for idx, row in enumerate(rows, start=1):
+        cand = dict(row)
+        if not str(cand.get("id") or "").strip():
+            cand["id"] = f"row_{idx}"
+        try:
+            sample = BenchmarkSample(**cand)
+        except Exception:
+            all_benchmark = False
+            break
+        if not sample.messages or not has_sample_eval_criteria(sample):
+            all_benchmark = False
+            break
+
+    if all_benchmark:
+        return "benchmark"
+
+    metas = [row.get("metadata") for row in rows]
+    if all(isinstance(m, dict) for m in metas):
+        statuses = {str(m.get("status") or "").strip() for m in metas if isinstance(m, dict)}
+        if statuses and statuses.issubset({"DISCARDED", "PENDING"}):
+            has_discarded_status = "DISCARDED" in statuses
+            has_flywheel_inspect_meta = any(
+                isinstance(m, dict) and ("detected_defects" in m or "initial_score" in m)
+                for m in metas
+            )
+            if has_discarded_status or has_flywheel_inspect_meta:
+                return "flywheel_discarded"
+
+    return "flywheel_gold"
+
+
 @router.get("/")
 def list_datasets(db: Session = Depends(get_db)):
     os.makedirs(settings.DATASETS_DIR, exist_ok=True)
@@ -189,12 +236,17 @@ def list_datasets(db: Session = Depends(get_db)):
                     name=fname,
                     file_path=fpath,
                     sample_count=cnt,
-                    dataset_type="benchmark" if "bench" in fname or "eval" in fname else "flywheel_gold",
+                    dataset_type=_infer_dataset_type_from_file(fpath),
                 )
                 db.add(rec)
             else:
                 existing.sample_count = cnt
                 existing.file_path = fpath
+                if (
+                    existing.dataset_type == "flywheel_gold"
+                    and _infer_dataset_type_from_file(fpath) == "flywheel_discarded"
+                ):
+                    existing.dataset_type = "flywheel_discarded"
     db.commit()
 
     records = db.query(DatasetRecord).order_by(DatasetRecord.created_at.desc()).all()
@@ -263,9 +315,25 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
                 item["is_holdout"] = True
             try:
                 sample_obj = BenchmarkSample(**item)
-                # 导出时保留紧凑无冗余 None 的标准字典，若核心字段存在则完整输出
+                if not sample_obj.messages:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"第 {idx} 条评测题缺少有效的 messages 数组 (ID={sample_obj.id})",
+                    )
+                if not has_sample_eval_criteria(sample_obj):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"第 {idx} 条评测题缺少评判标准（必须至少包含 reference、rubric 或 regex_constraints 之一，ID={sample_obj.id}）。"
+                            "若为无答案的对话文件，请按训练集 (flywheel_gold) 导入。"
+                        ),
+                    )
+                # 导出时保留紧凑无冗余 None 的标准字典，并剥离文件自带的 eval_tracker 战绩快照
                 dump_dict = sample_obj.model_dump(exclude_none=True)
+                dump_dict.pop("eval_tracker", None)
                 candidate_rows.append(dump_dict)
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(
                     status_code=400,
@@ -321,9 +389,16 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
 
     _write_jsonl_atomic(fpath, final_rows)
 
-    # 覆盖重建同名数据集时，自然作废该路径下的历史评测流水，防止旧战绩残留
+    # 覆盖重建同名数据集时，自然作废该路径下的历史评测流水并重算样本池导出留底
     if not is_append:
         BenchmarkSamplingEngine.reset_trackers_in_db(db=db, dataset_path=fpath)
+        sync_lineage_on_dataset_overwritten(
+            db=db,
+            dataset_id=clean_id,
+            dataset_type=payload.dataset_type,
+            final_rows=final_rows,
+            commit=False,
+        )
 
     total_cnt = len(final_rows)
     imported_cnt = (
@@ -377,13 +452,14 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db))
 
 @router.delete("/{dataset_id}")
 def delete_dataset(dataset_id: str, db: Session = Depends(get_db)):
-    """删除指定数据集资产记录及本地文件（含去重向量旁路缓存）"""
+    """删除指定数据集资产记录及本地文件（含去重向量旁路缓存并同步清理样本池导出留底）"""
     rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
     fpath = rec.file_path if rec else os.path.join(settings.DATASETS_DIR, f"{dataset_id}.jsonl")
 
+    sync_lineage_on_dataset_removed(db, dataset_id, commit=False)
     if rec:
         db.delete(rec)
-        db.commit()
+    db.commit()
 
     if os.path.exists(fpath):
         try:
@@ -459,9 +535,11 @@ def export_filtered_benchmark_dataset(
     if not filtered:
         raise HTTPException(status_code=400, detail="当前抽样及过滤条件下未命中任何可导出的评测样本")
 
+    keep_tracker = payload.export_target == "download" and bool(payload.include_tracker)
+
     def _serialize_sample(s: BenchmarkSample) -> Dict[str, Any]:
         d = s.model_dump(exclude_none=True)
-        if not payload.include_tracker:
+        if not keep_tracker:
             d.pop("eval_tracker", None)
         return d
 
@@ -543,6 +621,13 @@ def export_filtered_benchmark_dataset(
 
     if payload.save_mode == "overwrite":
         BenchmarkSamplingEngine.reset_trackers_in_db(db=db, dataset_path=target_fpath)
+    sync_lineage_on_dataset_overwritten(
+        db=db,
+        dataset_id=clean_target_id,
+        dataset_type="benchmark",
+        final_rows=final_rows,
+        commit=False,
+    )
 
     display_name = (payload.target_dataset_name or "").strip() or target_fname
     now_ts = int(time.time())

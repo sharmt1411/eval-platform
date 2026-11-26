@@ -78,9 +78,8 @@ class BenchmarkSamplingEngine:
 
     @staticmethod
     def get_or_create_tracker(sample: BenchmarkSample) -> SampleEvalTracker:
-        """获取样本现存战绩，若缺失则返回初始状态 (c=0, m=0, I=1)"""
-        if sample.eval_tracker is not None:
-            return sample.eval_tracker.model_copy(deep=True)
+        """返回空白初始战绩 (c=0, m=0, I=1)，忽略文件自带的 eval_tracker 快照。"""
+        _ = sample
         return SampleEvalTracker()
 
     @classmethod
@@ -337,10 +336,10 @@ class BenchmarkSamplingEngine:
             )
         else:
             for item in samples:
-                resolved_trackers[item.id] = cls.get_or_create_tracker(item)
+                resolved_trackers[item.id] = SampleEvalTracker()
 
         if not config.enabled:
-            for sample in candidate_samples:
+            for sample in samples:
                 tr = resolved_trackers.get(sample.id, SampleEvalTracker())
                 tr.target_interval = cls.compute_target_interval(
                     tr, x=x, s=s, n=n, is_holdout=sample.is_holdout
@@ -381,14 +380,19 @@ class BenchmarkSamplingEngine:
         pool_cooldown: List[BenchmarkSample] = []
         cooldown_pool_ids: Set[str] = set()
 
-        for sample in candidate_samples:
-            tr = resolved_trackers.get(sample.id, SampleEvalTracker())
-            target_interval = cls.compute_target_interval(
-                tr, x=x, s=s, n=n, is_holdout=sample.is_holdout
+        # 同步覆盖全量样本内存上的 eval_tracker，防止未命中 holdout_filter 的样本保留文件自带陈旧快照
+        for sample in samples:
+            if sample.id not in resolved_trackers:
+                resolved_trackers[sample.id] = SampleEvalTracker()
+            tr_full = resolved_trackers[sample.id]
+            tr_full.target_interval = cls.compute_target_interval(
+                tr_full, x=x, s=s, n=n, is_holdout=sample.is_holdout
             )
-            tr.target_interval = target_interval
-            resolved_trackers[sample.id] = tr
-            sample.eval_tracker = tr
+            sample.eval_tracker = tr_full
+
+        for sample in candidate_samples:
+            tr = resolved_trackers[sample.id]
+            target_interval = tr.target_interval
 
             if tr.consecutive_pass >= x:
                 cooldown_pool_ids.add(sample.id)

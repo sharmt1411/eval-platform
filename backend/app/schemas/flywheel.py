@@ -94,6 +94,7 @@ class SimulationRunRequest(BaseModel):
 class BatchUpdateStatusRequest(BaseModel):
     sample_ids: List[str] = Field(..., min_length=1)
     status: Literal["PENDING", "GOLD_PASS", "REPAIRED_PASS", "DISCARDED", "MANUAL_APPROVED"]
+    active_version: Optional[Literal["raw", "remediated"]] = None
     reviewer_comment: Optional[str] = None
 
 
@@ -152,6 +153,14 @@ class ExportBenchmarkDatasetRequest(BaseModel):
     name: str
     slice_ids: Optional[List[str]] = None
     mode: Literal["create", "append"] = "create"
+    reserve_for_training: bool = Field(
+        default=False,
+        description="预留后续进训练集：设为 True 时主动标记为普通题 (is_holdout=False)",
+    )
+    is_holdout: Optional[bool] = Field(
+        default=None,
+        description="可选显式指定是否留出题；若来源对话已进过训练集则禁止传 True",
+    )
     dedup_config: Optional[DedupConfig] = None
 
 
@@ -161,6 +170,14 @@ class BatchExportBenchmarkRequest(BaseModel):
     name: str
     mode: Literal["create", "append"] = "create"
     strategy: Literal["all_defects", "primary_defect_only"] = "all_defects"
+    reserve_for_training: bool = Field(
+        default=False,
+        description="预留后续进训练集：设为 True 时主动标记为普通题 (is_holdout=False)",
+    )
+    is_holdout: Optional[bool] = Field(
+        default=None,
+        description="可选显式指定是否留出题；若来源对话已进过训练集则禁止传 True",
+    )
     dedup_config: Optional[DedupConfig] = None
 
 

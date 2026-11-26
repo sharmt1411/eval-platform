@@ -156,7 +156,8 @@ export const FlywheelWorkbench: React.FC = () => {
 
   // 批量状态更新模态框
   const [batchStatusModalVisible, setBatchStatusModalVisible] = useState<boolean>(false);
-  const [targetBatchStatus, setTargetBatchStatus] = useState<FlywheelStatus>('GOLD_PASS');
+  const [targetBatchStatus, setTargetBatchStatus] = useState<FlywheelStatus>('MANUAL_APPROVED');
+  const [batchActiveVersion, setBatchActiveVersion] = useState<'auto' | 'raw' | 'remediated'>('auto');
   const [batchStatusForm] = Form.useForm();
 
   // 批量定点补考模态框
@@ -179,6 +180,7 @@ export const FlywheelWorkbench: React.FC = () => {
   const [reviewDrawerVisible, setReviewDrawerVisible] = useState<boolean>(false);
   const [currentSample, setCurrentSample] = useState<FlywheelSampleRecord | null>(null);
   const [remediatedMessages, setRemediatedMessages] = useState<ChatMessage[]>([]);
+  const [selectedActiveVersion, setSelectedActiveVersion] = useState<'raw' | 'remediated'>('raw');
   const [reviewerComment, setReviewerComment] = useState<string>('');
 
   // 测评切题状态 (抽屉内 Tab 2)
@@ -385,6 +387,10 @@ export const FlywheelWorkbench: React.FC = () => {
   const openReviewDrawer = (sample: FlywheelSampleRecord) => {
     setCurrentSample(sample);
     setRemediatedMessages(sample.remediated_messages || sample.raw_messages || []);
+    setSelectedActiveVersion(
+      sample.active_version ||
+        (sample.remediated_messages && sample.remediated_messages.length > 0 ? 'remediated' : 'raw')
+    );
     setReviewerComment(sample.reviewer_comment || '');
     setActiveDrawerTab('diff');
     setReviewDrawerVisible(true);
@@ -424,6 +430,7 @@ export const FlywheelWorkbench: React.FC = () => {
         dataset_id: values.dataset_id,
         name: values.name,
         mode: values.mode,
+        reserve_for_training: Boolean(values.reserve_for_training),
         dedup_config: buildDedupConfigFromForm(values, 5),
       });
       const keptSliceCount = res.dedup_stats?.enabled
@@ -434,7 +441,17 @@ export const FlywheelWorkbench: React.FC = () => {
       );
       setExportSingleBenchmarkVisible(false);
       if (keptSliceCount > 0) {
-        setCurrentSample((prev) => (prev ? { ...prev, exported_to_benchmark: true } : prev));
+        setCurrentSample((prev) =>
+          prev
+            ? {
+                ...prev,
+                exported_to_benchmark: true,
+                exported_benchmark_datasets: Array.from(
+                  new Set([...(prev.exported_benchmark_datasets || []), res.dataset_id])
+                ),
+              }
+            : prev
+        );
       }
       loadData();
     } catch (e: any) {
@@ -454,6 +471,7 @@ export const FlywheelWorkbench: React.FC = () => {
         name: values.name,
         mode: values.mode,
         strategy: values.strategy,
+        reserve_for_training: Boolean(values.reserve_for_training),
         dedup_config: buildDedupConfigFromForm(values, 5),
       });
       message.success(
@@ -475,6 +493,7 @@ export const FlywheelWorkbench: React.FC = () => {
     try {
       await flywheelApi.updateSample(currentSample.id, {
         status,
+        active_version: status === 'MANUAL_APPROVED' ? selectedActiveVersion : undefined,
         remediated_messages: remediatedMessages,
         reviewer_comment: reviewerComment,
       });
@@ -482,7 +501,7 @@ export const FlywheelWorkbench: React.FC = () => {
       setReviewDrawerVisible(false);
       loadData();
     } catch (e: any) {
-      message.error(`更新失败: ${e.message}`);
+      message.error(`更新失败: ${e.response?.data?.detail || e.message}`);
     }
   };
 
@@ -618,6 +637,10 @@ export const FlywheelWorkbench: React.FC = () => {
         ...currentSample,
         rule_id: res.rule_id || currentSample.rule_id,
         status: res.status as FlywheelStatus,
+        raw_verdict: (res.raw_verdict as any) || currentSample.raw_verdict,
+        remediated_verdict: (res.remediated_verdict as any) || currentSample.remediated_verdict,
+        manual_decision: (res.manual_decision as any) || currentSample.manual_decision,
+        active_version: res.active_version || currentSample.active_version,
         score: res.score,
         remediated_messages: res.remediated_messages || currentSample.remediated_messages,
         initial_eval: res.initial_eval || currentSample.initial_eval,
@@ -625,6 +648,9 @@ export const FlywheelWorkbench: React.FC = () => {
         remediation_debug: res.status === 'GOLD_PASS' ? null : (res.remediation_debug ?? null),
       };
       setCurrentSample(updatedSample);
+      if (res.active_version) {
+        setSelectedActiveVersion(res.active_version);
+      }
       if (res.remediated_messages) {
         setRemediatedMessages(res.remediated_messages);
       }
@@ -694,11 +720,18 @@ export const FlywheelWorkbench: React.FC = () => {
         ...currentSample,
         rule_id: res.rule_id || values.rule_id,
         status: res.status as FlywheelStatus,
+        raw_verdict: (res.raw_verdict as any) || currentSample.raw_verdict,
+        remediated_verdict: (res.remediated_verdict as any) || currentSample.remediated_verdict,
+        manual_decision: (res.manual_decision as any) || currentSample.manual_decision,
+        active_version: res.active_version || currentSample.active_version,
         score: res.score,
         initial_eval: targetData === 'raw' && res.initial_eval ? res.initial_eval : currentSample.initial_eval,
         verified_eval: targetData === 'remediated' && res.verified_eval ? res.verified_eval : currentSample.verified_eval,
       };
       setCurrentSample(updatedSample);
+      if (res.active_version) {
+        setSelectedActiveVersion(res.active_version);
+      }
       loadData();
     } catch (e: any) {
       if (e?.name === 'CanceledError' || e?.name === 'AbortError' || e?.code === 'ERR_CANCELED') {
@@ -763,6 +796,7 @@ export const FlywheelWorkbench: React.FC = () => {
 
   const openBatchStatusModal = (status: FlywheelStatus) => {
     setTargetBatchStatus(status);
+    setBatchActiveVersion('auto');
     batchStatusForm.resetFields();
     setBatchStatusModalVisible(true);
   };
@@ -775,6 +809,10 @@ export const FlywheelWorkbench: React.FC = () => {
       const res = await flywheelApi.batchUpdateStatus({
         sample_ids: selectedRowKeys as string[],
         status: targetBatchStatus,
+        active_version:
+          targetBatchStatus === 'MANUAL_APPROVED' && batchActiveVersion !== 'auto'
+            ? batchActiveVersion
+            : undefined,
         reviewer_comment: values.reviewer_comment || undefined,
       });
       message.success(res.message);
@@ -782,7 +820,7 @@ export const FlywheelWorkbench: React.FC = () => {
       setSelectedRowKeys([]);
       loadData();
     } catch (e: any) {
-      message.error(`批量修改状态失败: ${e.message}`);
+      message.error(`批量修改状态失败: ${e.response?.data?.detail || e.message}`);
     } finally {
       setBatchActionLoading(false);
     }
@@ -1086,16 +1124,16 @@ export const FlywheelWorkbench: React.FC = () => {
               menu={{
                 items: [
                   {
-                    key: 'GOLD_PASS',
-                    icon: <CheckOutlined className="text-emerald-600" />,
-                    label: '批量标定为黄金样本 (GOLD_PASS)',
-                    onClick: () => openBatchStatusModal('GOLD_PASS'),
-                  },
-                  {
                     key: 'MANUAL_APPROVED',
                     icon: <CheckOutlined className="text-purple-600" />,
                     label: '批量人工放行 (MANUAL_APPROVED)',
                     onClick: () => openBatchStatusModal('MANUAL_APPROVED'),
+                  },
+                  {
+                    key: 'PENDING',
+                    icon: <ReloadOutlined className="text-amber-600" />,
+                    label: '退回待复核 (PENDING)',
+                    onClick: () => openBatchStatusModal('PENDING'),
                   },
                   {
                     key: 'DISCARDED',
@@ -1245,19 +1283,62 @@ export const FlywheelWorkbench: React.FC = () => {
               ),
             },
             {
-              title: '治理状态',
+              title: '治理状态与去向留底',
               dataIndex: 'status',
-              width: 220,
-              render: (status, record) => (
-                <Space size={4} wrap>
-                  {getStatusTag(status)}
-                  {record.exported_to_benchmark && (
-                    <Tag color="purple" className="m-0 text-3xs">
-                      🔒 已进评测集
-                    </Tag>
-                  )}
-                </Space>
-              ),
+              width: 260,
+              render: (status, record) => {
+                const trainDs = record.exported_training_datasets || [];
+                const benchDs = record.exported_benchmark_datasets || [];
+                const hasBench = benchDs.length > 0 || Boolean(record.exported_to_benchmark);
+                const remedWarn = record.remediated_verdict === 'UNVERIFIED';
+                const rawErr = record.raw_verdict === 'ERROR';
+                return (
+                  <Space direction="vertical" size={2}>
+                    <Space size={4} wrap>
+                      {getStatusTag(status)}
+                      {record.active_version === 'remediated' && (
+                        <Tag color="geekblue" className="m-0 text-3xs">
+                          修复版生效
+                        </Tag>
+                      )}
+                      {remedWarn && (
+                        <Tag color="gold" className="m-0 text-3xs">
+                          修复待验收
+                        </Tag>
+                      )}
+                      {rawErr && (
+                        <Tag color="red" className="m-0 text-3xs">
+                          初检异常
+                        </Tag>
+                      )}
+                    </Space>
+                    {(trainDs.length > 0 || hasBench) && (
+                      <Space size={4} wrap>
+                        {trainDs.length > 0 && (
+                          <Tooltip title={`已导出至训练集: ${trainDs.join(', ')}`}>
+                            <Tag color="cyan" className="m-0 text-3xs">
+                              📦 已进训练集 ({trainDs.length})
+                            </Tag>
+                          </Tooltip>
+                        )}
+                        {hasBench && (
+                          <Tooltip
+                            title={
+                              benchDs.length > 0
+                                ? `已切题导出评测集: ${benchDs.join(', ')}`
+                                : '已切题导出评测集'
+                            }
+                          >
+                            <Tag color="purple" className="m-0 text-3xs">
+                              🔒 已出评测题 ({benchDs.length || 1})
+                            </Tag>
+                          </Tooltip>
+                        )}
+                      </Space>
+                    )}
+                  </Space>
+                );
+              },
             },
             {
               title: '质检缺陷简报',
@@ -1358,6 +1439,28 @@ export const FlywheelWorkbench: React.FC = () => {
             <span className="text-sm text-slate-600">目标治理状态:</span>
             {getStatusTag(targetBatchStatus)}
           </div>
+          {targetBatchStatus === 'MANUAL_APPROVED' && (
+            <>
+              <Alert
+                type="info"
+                showIcon
+                className="text-xs"
+                message="批量人工放行须具备有效质检结论；未质检或质检报错样本将被拦截。"
+              />
+              <div>
+                <div className="text-xs font-medium text-slate-700 mb-1">导出时选用的对话版本:</div>
+                <Radio.Group
+                  value={batchActiveVersion}
+                  onChange={(e) => setBatchActiveVersion(e.target.value)}
+                  size="small"
+                >
+                  <Radio value="auto">自动（有修复版选修复版，否则原对话）</Radio>
+                  <Radio value="remediated">强制修复后对话</Radio>
+                  <Radio value="raw">强制原对话</Radio>
+                </Radio.Group>
+              </div>
+            </>
+          )}
           <Form form={batchStatusForm} layout="vertical">
             <Form.Item name="reviewer_comment" label="批量复核说明 / 专家评审意见 (可选)">
               <Input.TextArea
@@ -1567,18 +1670,10 @@ export const FlywheelWorkbench: React.FC = () => {
               </Button>
               <Button
                 type="primary"
-                ghost
                 icon={<CheckOutlined />}
                 onClick={() => handleUpdateStatus('MANUAL_APPROVED')}
               >
-                人工放行 (APPROVED)
-              </Button>
-              <Button
-                type="primary"
-                icon={<CheckOutlined />}
-                onClick={() => handleUpdateStatus('GOLD_PASS')}
-              >
-                标定为黄金样本 (GOLD_PASS)
+                人工放行 ({selectedActiveVersion === 'remediated' ? '修复版' : '原对话'})
               </Button>
             </Space>
           </div>
@@ -1651,8 +1746,48 @@ export const FlywheelWorkbench: React.FC = () => {
               </Space>
             </div>
 
-            {/* 顶栏质检与修复行为指引条 */}
-            <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 flex items-center justify-between text-xs text-slate-600">
+            {/* 顶栏质检与修复行为指引条 + 三结论/留底透视 */}
+            <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 space-y-1.5 text-xs text-slate-600">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-semibold text-slate-700">状态解耦:</span>
+                  <Tag color={currentSample.raw_verdict === 'PASS' ? 'green' : currentSample.raw_verdict === 'ERROR' ? 'red' : 'default'}>
+                    原对话: {currentSample.raw_verdict || 'UNJUDGED'}
+                  </Tag>
+                  <Tag color={currentSample.remediated_verdict === 'PASS' ? 'blue' : currentSample.remediated_verdict === 'UNVERIFIED' ? 'gold' : 'default'}>
+                    修复版: {currentSample.remediated_verdict || 'NONE'}
+                  </Tag>
+                  <Tag color={currentSample.manual_decision === 'APPROVED' ? 'purple' : currentSample.manual_decision === 'REJECTED' ? 'red' : 'default'}>
+                    人工: {currentSample.manual_decision || 'NONE'}
+                  </Tag>
+                  {(currentSample.exported_training_datasets?.length || 0) > 0 && (
+                    <Tag color="cyan">
+                      📦 训练集留底: {currentSample.exported_training_datasets!.join(', ')}
+                    </Tag>
+                  )}
+                  {(currentSample.exported_benchmark_datasets?.length || 0) > 0 && (
+                    <Tag color="purple">
+                      🔒 评测集留底: {currentSample.exported_benchmark_datasets!.join(', ')}
+                    </Tag>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-600 font-medium">导出/放行选用版本:</span>
+                  <Radio.Group
+                    size="small"
+                    value={selectedActiveVersion}
+                    onChange={(e) => setSelectedActiveVersion(e.target.value)}
+                  >
+                    <Radio.Button value="raw">原对话</Radio.Button>
+                    <Radio.Button
+                      value="remediated"
+                      disabled={!remediatedMessages || remediatedMessages.length === 0}
+                    >
+                      修复后对话
+                    </Radio.Button>
+                  </Radio.Group>
+                </div>
+              </div>
               <div className="flex items-center gap-2">
                 <InfoCircleOutlined className="text-blue-500 shrink-0 text-sm" />
                 <span>
@@ -2258,6 +2393,26 @@ export const FlywheelWorkbench: React.FC = () => {
             </Radio.Group>
           </Form.Item>
 
+          {(currentSample?.exported_training_datasets?.length || 0) > 0 ? (
+            <Alert
+              type="warning"
+              showIcon
+              className="mb-3 text-xs"
+              message="该样本已进过训练集，导出评测题将自动标为普通题"
+              description={`训练集留底: ${currentSample?.exported_training_datasets?.join(', ')}。为防止误统计留出通过率，导出后对应评测题的 is_holdout 将强制设为 false。`}
+            />
+          ) : (
+            <Form.Item
+              name="reserve_for_training"
+              label="预留后续进训练集（主动标记为普通题）"
+              valuePropName="checked"
+              initialValue={false}
+              extra="未进过训练集的样本默认标为纯评测留出题 (is_holdout=true)；若计划后续也将其纳入微调训练集，可提前开启此项"
+            >
+              <Switch checkedChildren="标为普通题" unCheckedChildren="默认留出题" />
+            </Form.Item>
+          )}
+
           {renderDedupFields(5, true)}
         </Form>
       </Modal>
@@ -2324,6 +2479,16 @@ export const FlywheelWorkbench: React.FC = () => {
                 <Radio value="create">覆盖创建新文件</Radio>
                 <Radio value="append">追加至现有同名评测集 (序列哈希与簇配额去重)</Radio>
               </Radio.Group>
+            </Form.Item>
+
+            <Form.Item
+              name="reserve_for_training"
+              label="预留后续进训练集（统一标为普通题）"
+              valuePropName="checked"
+              initialValue={false}
+              extra="默认关闭：未进过训练集的样本导出为留出题，已进过训练集的样本自动强制标为普通题；开启后全部标记为普通题 (is_holdout=false)"
+            >
+              <Switch checkedChildren="全部普通题" unCheckedChildren="按留底自动标记" />
             </Form.Item>
 
             {renderDedupFields(5, true)}
